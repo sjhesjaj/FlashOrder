@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.flashorder.order.PaymentMapper">
+    <resultMap id="lockedOrder" type="com.flashorder.order.PaymentMapper$LockedOrder">
+        <constructor>
+            <arg column="id" javaType="_long"/>
+            <arg column="order_uid" javaType="string"/>
+            <arg column="campaign_id" javaType="_long"/>
+            <arg column="status" javaType="string"/>
+            <arg column="paid_at" javaType="java.time.LocalDateTime"/>
+        </constructor>
+    </resultMap>
+
+    <resultMap id="paidOrderDetails" type="com.flashorder.order.PaymentMapper$PaidOrderDetails">
+        <constructor>
+            <arg column="request_uid" javaType="string"/>
+            <arg column="paid_at" javaType="java.time.LocalDateTime"/>
+        </constructor>
+    </resultMap>
+
+    <select id="lockOwnedOrder" resultMap="lockedOrder">
+        SELECT id, order_uid, campaign_id, status, paid_at
+        FROM purchase_order
+        WHERE order_uid = #{orderUid} AND user_id = #{userId}
+        FOR UPDATE
+    </select>
+
+    <select id="findAttempt" resultType="com.flashorder.order.PaymentOutcome">
+        SELECT result
+        FROM payment_attempt
+        WHERE order_id = #{orderId} AND idempotency_key = #{idempotencyKey}
+    </select>
+
+    <update id="markPaidBeforeDeadline">
+        UPDATE purchase_order
+        SET status = 'PAID', paid_at = NOW(6)
+        WHERE id = #{orderId} AND status = 'PENDING' AND NOW(6) &lt; expire_at
+    </update>
+
+    <insert id="insertAttempt">
+        INSERT INTO payment_attempt (order_id, idempotency_key, result, created_at)
+        VALUES (#{orderId}, #{idempotencyKey}, #{result}, NOW(6))
+    </insert>
+
+    <select id="findPaidOrderDetails" resultMap="paidOrderDetails">
+        SELECT r.request_uid, o.paid_at
+        FROM purchase_order AS o
+        JOIN purchase_request AS r ON r.id = o.request_id
+        WHERE o.id = #{orderId}
+    </select>
+</mapper>
