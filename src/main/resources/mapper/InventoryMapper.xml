@@ -2,6 +2,44 @@
 <!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
         "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
 <mapper namespace="com.flashorder.inventory.InventoryMapper">
+    <resultMap id="inventoryCounts" type="com.flashorder.inventory.InventoryMapper$InventoryCounts">
+        <constructor>
+            <arg column="total" javaType="_int"/>
+            <arg column="available" javaType="_int"/>
+            <arg column="pending" javaType="_long"/>
+            <arg column="paid" javaType="_long"/>
+        </constructor>
+    </resultMap>
+
+    <resultMap id="requestOrderDiscrepancies" type="com.flashorder.inventory.InventoryMapper$RequestOrderDiscrepancies">
+        <constructor>
+            <arg column="created_without_order" javaType="_long"/>
+            <arg column="non_created_with_order" javaType="_long"/>
+        </constructor>
+    </resultMap>
+
+    <select id="findInventoryCounts" resultMap="inventoryCounts">
+        SELECT i.total, i.available,
+               (SELECT COUNT(*) FROM purchase_order o
+                WHERE o.campaign_id = i.campaign_id AND o.status = 'PENDING') AS pending,
+               (SELECT COUNT(*) FROM purchase_order o
+                WHERE o.campaign_id = i.campaign_id AND o.status = 'PAID') AS paid
+        FROM inventory i
+        WHERE i.campaign_id = #{campaignId}
+    </select>
+
+    <select id="findRequestOrderDiscrepancies" resultMap="requestOrderDiscrepancies">
+        SELECT COUNT(CASE WHEN r.status = 'ORDER_CREATED'
+                          AND (o.id IS NULL OR r.order_id IS NULL OR o.id &lt;&gt; r.order_id)
+                          THEN 1 END) AS created_without_order,
+               COUNT(CASE WHEN r.status IN ('ACCEPTED', 'REJECTED') AND o.id IS NOT NULL
+                          THEN 1 END) AS non_created_with_order
+        FROM purchase_request r
+        LEFT JOIN purchase_order o ON o.request_id = r.id
+        WHERE r.campaign_id = #{campaignId}
+          AND r.status IN ('ORDER_CREATED', 'ACCEPTED', 'REJECTED')
+    </select>
+
     <update id="reserve">
         UPDATE inventory
         SET available = available - 1
