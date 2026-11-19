@@ -26,16 +26,16 @@ final class MySqlTestDatabase {
     }
 
     private static final class LocalMysql {
-        private static final MySQLContainer INSTANCE = startMysql();
+        private static final MySQLContainer INSTANCE = startMysql("flashorder_test");
+    }
 
-        private static MySQLContainer startMysql() {
-            var mysql = new MySQLContainer("mysql:8.4")
-                    .withDatabaseName("flashorder_test")
-                    .withUsername("flashorder")
-                    .withPassword("flashorder")
-                    .withCommand("--transaction-isolation=READ-COMMITTED", "--default-time-zone=+00:00");
-            mysql.start();
-            return mysql;
-        }
+    static MySQLContainer startMysql(String databaseName) {
+        var mysql = new MySQLContainer("mysql:8.4")
+                .withDatabaseName(databaseName)
+                .withUsername("flashorder")
+                .withPassword("flashorder")
+                .withCommand("--transaction-isolation=READ-COMMITTED", "--default-time-zone=+00:00");
+        mysql.start();
+        return mysql;
     }
 }

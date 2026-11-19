@@ -1,6 +1,6 @@
 # FlashOrder V1 设计
 
-> 状态：2026-11-19 定稿，A–F 决策全部合入。同日设计评审的 M1 修订（G1–G5）已合入，M3、M4 修订（G6–G8）在对应里程碑开工前写入。理由见 [decisions.md](decisions.md)。原稿存档在 [archive/design-v1-draft.md](archive/design-v1-draft.md)。
+> 状态：2026-11-19 定稿，A–F 决策和 G1–G7 修订已合入。G8 对应 M4。理由见 [decisions.md](decisions.md)。原稿存档在 [archive/design-v1-draft.md](archive/design-v1-draft.md)。
 
 **第一版做一条完整的限量抢购链路：提交请求 → 异步建单并预留库存 → 模拟支付或超时释放 → 查到最终结果。**
 
@@ -50,7 +50,7 @@ com.flashorder
 | `consumer` | Kafka 监听、建单用例 |
 | `scheduler` | 超时取消、Outbox Relay（两者都是定时轮询数据库的后台任务） |
 
-M2 的本地 `dev` 配置组合启用 `api` 和 `scheduler`。单独启用 `scheduler` 时进程只执行后台任务。M3 接入 `consumer` 后，本地可在一个进程里启用三个角色，压测时再拆成独立进程。
+本地 `dev` 组合启用 `api`、`scheduler` 和 `consumer`。单独运行 `scheduler` 或 `consumer` 时不开 HTTP。在 `async` 模式启动 Relay 和 Kafka 监听，压测时可将三个角色拆成独立进程。
 
 **受理模式开关：** `flashorder.intake-mode=sync|async`。`sync` 是 M1 的同步基线，在 HTTP 线程里把受理和建单放进同一个事务。`async` 走 Kafka。两种模式调用同一个建单用例，方便做同负载对比。
 
@@ -72,30 +72,32 @@ sequenceDiagram
     A->>A: 活动窗口、售罄缓存、全局限流、在途上限
     A->>D: 同事务写入请求记录与建单命令
     D-->>A: 事务提交
-    A-->>U: 202 + requestId + Retry-After
+    A-->>U: 202 + requestUid + Location + Retry-After
 
-    S->>D: 批量领取未发布命令（SKIP LOCKED）
+    S->>D: 短事务领取消息，写租约并提交
     S->>K: 发布，key = campaign_id
     K-->>S: ACK
-    S->>D: 标记已发布
+    S->>D: 按消息 ID 和租约令牌确认已发布
 
     K->>W: 投递命令
     W->>D: 同事务：锁请求、建单、写事件、写结果，最后扣库存
     D-->>W: 事务提交
     W->>K: 提交 offset
 
-    U->>A: 查询 requestId
+    U->>A: 查询 requestUid
     A->>D: 读该用户的请求结果
     A-->>U: 处理中 / 已建单 / 已拒绝 / 系统失败
 ```
 
 ### 1.1 `202` 以 MySQL 受理事务提交为准
 
-受理事务提交后才返回 `202`，用户拿到 `requestId` 就能查到"处理中"。代价是入口多一个短事务和 Outbox 发布开销，可以用受理延迟、受理到终态延迟、积压清空时间来衡量。 [HTTP 202 语义](https://www.rfc-editor.org/rfc/rfc9110.html#section-15.3.3) · [Transactional Outbox](https://docs.aws.amazon.com/prescriptive-guidance/latest/cloud-design-patterns/transactional-outbox.html)
+受理事务提交后才返回 `202`。客户端用 `Location` 指向的 `/purchase-requests/{requestUid}` 查询请求状态，处理中响应附带 `Retry-After`。代价是入口多一个短事务和 Outbox 发布开销，可以用受理延迟、受理到终态延迟、积压清空时间来衡量。 [HTTP 202 语义](https://www.rfc-editor.org/rfc/rfc9110.html#section-15.3.3) · [Transactional Outbox](https://docs.aws.amazon.com/prescriptive-guidance/latest/cloud-design-patterns/transactional-outbox.html)
 
 ### 1.2 入口检查顺序
 
 按顺序执行，便宜的检查放在前面：
+
+M3 执行身份检查、幂等回查和数据库受理事务。Redis 限流、活动窗口预检、售罄缓存和在途上限随 M4 接入。
 
 1. 从请求头 `X-User-Id` 取当前用户（第一版模拟登录，真实认证留到后续）。
 2. **用户级限流**，在 Redis 里做令牌桶，超限返回 `429`。
@@ -115,11 +117,12 @@ sequenceDiagram
 ### 1.3 Kafka 与 Relay
 
 - Topic `flashorder.order-commands`，**key 为 `campaign_id`**。同一活动的命令进同一个分区，由一个消费者线程依次处理，消费者之间不会在库存行上排队。代价是单个活动的吞吐受单线程限制。分区数不少于同时进行的活动数，本地默认 6 个。
-- 生产者：`acks=all`，开启幂等生产者。Relay 的 `delivery.timeout.ms` 调小（比如 10 s），避免 Kafka 停机时事务长时间占着行锁和连接。发布失败就回滚，退避后重试。
-- Relay 用 `SELECT ... WHERE published_at IS NULL ORDER BY id LIMIT n FOR UPDATE SKIP LOCKED` 批量领取，全部 ACK 后标记 `published_at`。可以多实例运行。已发布的 outbox 行定期清理。
-- 消费者：关闭自动提交，按条提交 offset（`AckMode.RECORD`），数据库事务提交后再提交 offset。
+- 生产者使用 `acks=all` 和幂等发送。默认 `max.block.ms=1000`、`delivery.timeout.ms=5000`。
+- Relay 在短事务内用 `FOR UPDATE SKIP LOCKED` 领取未发布且租约为空或已过期的消息，写入 `lease_token`、`lease_until` 后提交。事务外发送。收到 Kafka ACK 后，按消息 ID 和租约令牌回写 `published_at`。发送失败或 ACK 后中断时，租约到期后允许重新领取。默认每批 20 条，租约 30 秒。
+- 消费者关闭自动提交，按条提交 offset（`AckMode.RECORD`）。先锁请求并核对命令里的请求和活动身份，数据库事务提交后再提交 offset。
 - 顺序：同一活动的命令在分区内有序，但多个 Relay 实例并发领取时，批与批之间可能交错。**第一版只保证近似的先到先得。**
 - 订单事件发到 `flashorder.order-events`，key 为订单号，事件带稳定的 `event_id`。第一版没有下游消费者。
+- Relay 每天按批清理超过 7 天的已发布 Outbox 行。清理保留所有待发布行。
 
 ### 1.4 重投与失败
 
@@ -128,7 +131,8 @@ sequenceDiagram
 | 情况 | 处理 |
 |---|---|
 | 业务拒绝：售罄、已持有资格 | 回滚到保存点，在同一个事务里写 `REJECTED` 和原因，不重试（见 2.2） |
-| 技术异常 | `DefaultErrorHandler` 按指数退避重试 3 次，用尽后先用独立事务把请求标成 `SYSTEM_FAILED`，再把消息转到 `flashorder.order-commands.DLT` |
+| 技术异常 | `DefaultErrorHandler` 在首次失败后指数退避重试 3 次。用尽后在一个恢复事务内锁住请求，把 `ACCEPTED` 转成 `SYSTEM_FAILED` 并写入死信 Outbox。提交结束后才允许确认原消息，死信由 Relay 发到 `flashorder.order-commands.DLT` |
+| 命令格式或身份无效 | 用来源主题、分区及 offset 派生稳定事件 ID，记录死信并保留请求原状态 |
 | 同一幂等键再次提交已失败的请求 | 返回 `409 REQUEST_FAILED`，带 `Idempotent-Replayed: true` 头，客户端换键重试 |
 
 活动窗口只在受理时按 `accepted_at` 判断一次，消费者不再检查。所以活动结束前受理的请求，结束后才处理也照样有效。
@@ -180,9 +184,9 @@ erDiagram
 | `purchase_request` | `id`、`request_uid`、`user_id`、`campaign_id`、`idempotency_key`、`status`、`reject_reason`、`order_id`、`accepted_at`、`finished_at` | `UNIQUE(user_id, idempotency_key)`、`UNIQUE(request_uid)`、`INDEX(campaign_id, status)` |
 | `purchase_order` | `id`、`order_uid`、`request_id`、`campaign_id`、`user_id`、`status`、`created_at`、`expire_at`、`paid_at`、`cancelled_at`、`active_flag` | `UNIQUE(order_uid)`、`UNIQUE(request_id)`、`UNIQUE(campaign_id, user_id, active_flag)`、`INDEX(status, expire_at)`、`INDEX(campaign_id, status)` |
 | `payment_attempt` | `id`、`order_id`、`idempotency_key`、`result`、`created_at` | `UNIQUE(order_id, idempotency_key)` |
-| `outbox_message` | `id`、`event_id`、`topic`、`msg_key`、`event_type`、`payload`（JSON）、`created_at`、`published_at` | `UNIQUE(event_id)`、`INDEX(published_at, id)` |
+| `outbox_message` | `id`、`event_id`、`topic`、`msg_key`、`event_type`、`payload`（JSON）、`created_at`、`published_at`、`lease_token`、`lease_until` | `UNIQUE(event_id)`、`INDEX(published_at, id)` |
 
-- 主键都用自增 `BIGINT`。对外暴露的 `request_uid`、`order_uid`、`event_id` 用 UUIDv7，避免随机 UUID 打乱 InnoDB 聚簇索引。
+- 主键都用自增 `BIGINT`。`request_uid`、`order_uid` 及常规 `event_id` 用 UUIDv7。死信事件 ID 由请求 ID 或来源位置确定性派生，重复恢复时仍使用原 ID。
 - **库存行只存 `total` 和 `available`。** 预留数和已售数按订单状态统计，所以支付不碰热点行。
 - **购买资格不单独建表。** `active_flag` 是生成列 `IF(status IN ('PENDING','PAID'), 1, NULL)`。MySQL 的唯一索引允许多个 NULL，所以一个用户在一个活动里最多只有一个待支付或已支付的订单。插入订单就是占资格，订单取消后资格自动释放。
 - `UNIQUE(request_id)` 保证一个请求最多生成一个订单。订单查询和支付都按 `order_uid` 定位订单，所以 `order_uid` 也要建唯一索引 `UNIQUE(order_uid)`。
@@ -271,7 +275,7 @@ SELECT i.total, i.available,
 | `REJECTED` | `409` + 原因（`SOLD_OUT` / `ALREADY_HOLDING`） |
 | `SYSTEM_FAILED` | `409 REQUEST_FAILED`，提示换键重试 |
 
-重放的响应额外带 `Idempotent-Replayed: true` 头。async 模式下首次提交总是返回 `202`；sync 模式下首次提交时，请求已经是终态了。
+重放的响应额外带 `Idempotent-Replayed: true`。async 模式下受理成功首次返回 `202`。sync 模式下受理成功首次返回建单终态。查询本人请求时返回 `200`，状态为 `ACCEPTED` 时附带 `Retry-After`。
 
 ## 四、指标
 

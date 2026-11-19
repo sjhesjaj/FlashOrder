@@ -1,6 +1,6 @@
 # FlashOrder
 
-FlashOrder 是限量抢购后端。M1 用 MySQL 条件更新、事务保存点和唯一索引实现同步建单。M2 加入模拟支付、超时归还库存和对账。建单、支付和取消的事件随各自的事务写入 Outbox，消息发布在 M3 接入。
+FlashOrder 是限量抢购后端。M1 实现同步建单，M2 加入模拟支付、超时归还库存和对账。M3 通过 MySQL Outbox 和 Kafka 实现异步建单、失败恢复和死信。两种受理模式共用建单事务逻辑。
 
 ## Windows 本地运行
 
@@ -30,9 +30,21 @@ curl.exe -sS http://127.0.0.1:8080/admin/campaigns/1/reconciliation
 
 支付成功返回 `200 PAID` 和 UTC `paidAt`。相同支付键重放原结果。过期订单由 `scheduler` 取消并归还库存，原建单键仍重放原订单，换键可重新下单。对账接口报告库存差额和请求与订单的关联差异。
 
-本地 `dev` 同时启用 `api` 和 `scheduler`。单独运行 `scheduler` 时只启动后台任务。每批默认处理至多 200 条到期订单，查不到可取消订单时结束本轮，默认等 1 秒开启下一轮。分别用 `flashorder.order-expiry.batch-size` 和 `flashorder.order-expiry.fixed-delay-ms` 调整。
+本地 `dev` 启用 `api`、`scheduler` 和 `consumer`，默认为同步受理。超时取消每批默认处理至多 200 条，查不到可取消订单时结束本轮，默认等 1 秒开启下一轮。分别用 `flashorder.order-expiry.batch-size` 和 `flashorder.order-expiry.fixed-delay-ms` 调整。
 
 `/actuator/health` 提供健康状态。`/actuator/prometheus` 输出 HTTP 延迟、连接池、建单、支付、取消及最近一次对账的库存差额。
+
+## M3 异步受理
+
+```powershell
+docker compose --profile async up -d --wait
+$env:FLASHORDER_INTAKE_MODE = 'async'
+.\mvnw.cmd spring-boot:run '-Dspring-boot.run.profiles=dev'
+```
+
+Kafka 默认绑定 `127.0.0.1:19092`。下单接口受理成功返回 `202`，用同一个 `X-User-Id` 轮询响应的 `Location`。查询到 `ORDER_CREATED` 后，可以按上面的示例支付。若返回 `SYSTEM_FAILED`，原幂等键重放返回 `409 REQUEST_FAILED`，换键可以重新提交。
+
+使用 `api`、`scheduler`、`consumer` profile 可分别启动三个进程，后台角色不开 HTTP。API 在 Kafka 暂时不可用时仍能持久化受理。Relay 默认每 250 ms 领取最多 20 条消息，租约为 30 秒。改用外部 Kafka 时设置 `FLASHORDER_KAFKA_BOOTSTRAP`。若外部集群禁用客户端建主题，请预建 `flashorder.order-commands`、`flashorder.order-events` 和 `flashorder.order-commands.DLT`，各 6 个分区。
 
 ## 升级用过旧种子迁移的 M1 数据库
 
@@ -59,7 +71,7 @@ $flywayLocal = @(
 .\mvnw.cmd test
 ```
 
-测试默认使用 Testcontainers 启动独立的 MySQL 8.4，覆盖抢购、幂等、故障回滚、支付等锁期间到期、多个取消任务并行和支付与取消竞争。也可用 `FLASHORDER_TEST_JDBC_URL`、`FLASHORDER_TEST_DB_USER` 和 `FLASHORDER_TEST_DB_PASSWORD` 指向空的专用测试库。测试会在该库写入数据，超时扫描也会处理该库的所有到期订单。
+测试默认通过 Testcontainers 启动独立的 MySQL 8.4 和 Kafka 4.2.2。覆盖抢购、支付与取消竞争、受理回包丢失、Kafka ACK 后 Relay 中断、提交订单后 offset 前失败和死信恢复。同步与订单闭环测试可用 `FLASHORDER_TEST_JDBC_URL`、`FLASHORDER_TEST_DB_USER` 和 `FLASHORDER_TEST_DB_PASSWORD` 指向空的专用测试库，异步测试单独启动一套隔离环境。
 
 ## 设计
 
