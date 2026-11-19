@@ -2,8 +2,8 @@ package com.flashorder.request;
 
 import io.micrometer.core.instrument.MeterRegistry;
 import java.net.URI;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Profile;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -15,9 +15,9 @@ import org.springframework.web.server.ResponseStatusException;
 
 @RestController
 @Profile("api")
-@ConditionalOnProperty(prefix = "flashorder", name = "intake-mode", havingValue = "sync")
 public class PurchaseRequestController {
 
+    private static final String RETRY_AFTER_SECONDS = "1";
     private final PurchaseRequestService requests;
     private final MeterRegistry meters;
 
@@ -49,11 +49,14 @@ public class PurchaseRequestController {
                 "replayed", Boolean.toString(submission.replayed())).increment();
 
         ResponseEntity.BodyBuilder response = switch (result.status()) {
+            case "ACCEPTED" -> ResponseEntity.accepted()
+                    .location(URI.create("/purchase-requests/" + result.requestUid()))
+                    .header(HttpHeaders.RETRY_AFTER, RETRY_AFTER_SECONDS);
             case "ORDER_CREATED" -> ResponseEntity.created(URI.create("/orders/" + result.orderUid()));
-            case "REJECTED" -> ResponseEntity.status(HttpStatus.CONFLICT);
+            case "REJECTED", "SYSTEM_FAILED" -> ResponseEntity.status(HttpStatus.CONFLICT);
             case "NOT_ACCEPTED" -> ResponseEntity.status("CAMPAIGN_NOT_FOUND".equals(result.reason())
                     ? HttpStatus.NOT_FOUND : HttpStatus.CONFLICT);
-            default -> throw new IllegalStateException("Unexpected synchronous purchase result: " + result.status());
+            default -> throw new IllegalStateException("Unexpected purchase result: " + result.status());
         };
         if (submission.replayed()) {
             response.header("Idempotent-Replayed", "true");
@@ -65,7 +68,13 @@ public class PurchaseRequestController {
     public ResponseEntity<PurchaseResult> findRequest(
             @PathVariable String requestUid, @RequestHeader("X-User-Id") long userId) {
         requireUser(userId);
-        return ResponseEntity.of(requests.find(userId, requestUid));
+        return requests.find(userId, requestUid).map(result -> {
+            ResponseEntity.BodyBuilder response = ResponseEntity.ok();
+            if ("ACCEPTED".equals(result.status())) {
+                response.header(HttpHeaders.RETRY_AFTER, RETRY_AFTER_SECONDS);
+            }
+            return response.body(result);
+        }).orElseGet(() -> ResponseEntity.notFound().build());
     }
 
     private static void requireUser(long userId) {

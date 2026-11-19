@@ -39,6 +39,14 @@
         SELECT EXISTS (SELECT 1 FROM campaign WHERE id = #{campaignId})
     </select>
 
+    <insert id="insertOrderCommand">
+        INSERT INTO outbox_message (event_id, topic, msg_key, event_type, payload, created_at)
+        VALUES (#{eventId}, 'flashorder.order-commands', CAST(#{campaignId} AS CHAR), 'CREATE_ORDER',
+                JSON_OBJECT('eventId', #{eventId}, 'requestId', #{requestId},
+                            'requestUid', #{requestUid}, 'campaignId', #{campaignId}),
+                NOW(6))
+    </insert>
+
     <update id="markCreated">
         UPDATE purchase_request
         SET status = 'ORDER_CREATED', order_id = #{orderId}, finished_at = NOW(6)

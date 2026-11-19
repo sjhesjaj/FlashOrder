@@ -19,13 +19,17 @@ public interface PurchaseRequestMapper {
 
     boolean campaignExists(@Param("campaignId") long campaignId);
 
+    int insertOrderCommand(@Param("eventId") String eventId, @Param("requestId") long requestId,
+                           @Param("requestUid") String requestUid, @Param("campaignId") long campaignId);
+
     int markCreated(@Param("requestId") long requestId, @Param("orderId") long orderId);
 
     int markRejected(@Param("requestId") long requestId, @Param("reason") String reason);
 
     record StoredPurchaseRequest(long campaignId, String requestUid, String status, String reason, String orderUid) {
         PurchaseResult result() {
-            return new PurchaseResult(requestUid, status, reason, orderUid);
+            String publicReason = "SYSTEM_FAILED".equals(status) ? "REQUEST_FAILED" : reason;
+            return new PurchaseResult(requestUid, status, publicReason, orderUid);
         }
     }
 }

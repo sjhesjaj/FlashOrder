@@ -2,32 +2,28 @@ package com.flashorder.request;
 
 import com.flashorder.common.GeneratedKey;
 import com.flashorder.common.UuidV7;
-import com.flashorder.inventory.InventoryMapper;
-import com.flashorder.order.OrderMapper;
-import com.flashorder.outbox.OutboxMapper;
 import com.flashorder.request.PurchaseRequestMapper.StoredPurchaseRequest;
-
 import java.util.Optional;
-
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.TransactionStatus;
 import org.springframework.transaction.annotation.Transactional;
-import org.springframework.transaction.interceptor.TransactionAspectSupport;
 
 @Service
 public class PurchaseRequestService {
     private final PurchaseRequestMapper requests;
-    private final OrderMapper orders;
-    private final InventoryMapper inventory;
-    private final OutboxMapper outbox;
+    private final PurchaseOrderProcessor orders;
+    private final boolean asyncIntake;
 
-    public PurchaseRequestService(PurchaseRequestMapper requests, OrderMapper orders,
-                                  InventoryMapper inventory, OutboxMapper outbox) {
+    public PurchaseRequestService(PurchaseRequestMapper requests, PurchaseOrderProcessor orders,
+                                  @Value("${flashorder.intake-mode:sync}") String intakeMode) {
         this.requests = requests;
         this.orders = orders;
-        this.inventory = inventory;
-        this.outbox = outbox;
+        this.asyncIntake = switch (intakeMode) {
+            case "sync" -> false;
+            case "async" -> true;
+            default -> throw new IllegalArgumentException("Invalid flashorder.intake-mode: " + intakeMode);
+        };
     }
 
     @Transactional
@@ -60,48 +56,20 @@ public class PurchaseRequestService {
             return rejectUnaccepted(campaignExists ? "CAMPAIGN_CLOSED" : "CAMPAIGN_NOT_FOUND");
         }
 
-        PurchaseResult result = attemptOrder(requestKey.requireId(), requestUid, campaignId, userId);
-        return new Submission(result, false);
+        long requestId = requestKey.requireId();
+        if (asyncIntake) {
+            if (requests.insertOrderCommand(UuidV7.next(), requestId, requestUid, campaignId) != 1) {
+                throw new IllegalStateException("Could not write the order command for " + requestUid);
+            }
+            return new Submission(new PurchaseResult(requestUid, "ACCEPTED", null, null), false);
+        }
+
+        return new Submission(orders.attemptOrder(requestId, requestUid, campaignId, userId), false);
     }
 
     public Optional<PurchaseResult> find(long userId, String requestUid) {
         return Optional.ofNullable(requests.findOwned(userId, requestUid))
                 .map(StoredPurchaseRequest::result);
-    }
-
-    private PurchaseResult attemptOrder(long requestId, String requestUid, long campaignId, long userId) {
-        TransactionStatus transaction = TransactionAspectSupport.currentTransactionStatus();
-        // The insert already holds the request row lock. Keep it if the order is rejected.
-        Object savepoint = transaction.createSavepoint();
-        String orderUid = UuidV7.next();
-        GeneratedKey orderKey = new GeneratedKey();
-        try {
-            orders.insertPending(orderUid, requestId, campaignId, userId, orderKey);
-        } catch (DuplicateKeyException exception) {
-            // The failed insert retains the duplicate index lock during this verification.
-            if (orders.hasActiveOrderConflict(campaignId, userId, requestId, orderUid)) {
-                return rejectOrder(transaction, savepoint, requestId, requestUid, "ALREADY_HOLDING");
-            }
-            throw exception;
-        }
-
-        outbox.insertOrderCreated(UuidV7.next(), orderUid, requestUid, campaignId, userId);
-        if (requests.markCreated(requestId, orderKey.requireId()) != 1) {
-            throw new IllegalStateException("Could not finish purchase request " + requestUid);
-        }
-        if (inventory.reserve(campaignId) == 0) {
-            return rejectOrder(transaction, savepoint, requestId, requestUid, "SOLD_OUT");
-        }
-        return new PurchaseResult(requestUid, "ORDER_CREATED", null, orderUid);
-    }
-
-    private PurchaseResult rejectOrder(TransactionStatus transaction, Object savepoint,
-                                       long requestId, String requestUid, String reason) {
-        transaction.rollbackToSavepoint(savepoint);
-        if (requests.markRejected(requestId, reason) != 1) {
-            throw new IllegalStateException("Could not reject purchase request " + requestUid);
-        }
-        return new PurchaseResult(requestUid, "REJECTED", reason, null);
     }
 
     private static Submission replay(long campaignId, StoredPurchaseRequest existing) {
