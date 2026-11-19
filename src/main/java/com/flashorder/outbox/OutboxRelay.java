@@ -28,6 +28,7 @@ import org.springframework.transaction.annotation.Transactional;
 @Profile("scheduler")
 @ConditionalOnProperty(name = "flashorder.intake-mode", havingValue = "async")
 public class OutboxRelay {
+    static final String BATCH_SIZE_PROPERTY = "${flashorder.outbox-relay.batch-size:100}";
     private static final Logger LOG = LoggerFactory.getLogger(OutboxRelay.class);
     private static final int MARK_RESERVE_MS = 1000;
 
@@ -38,7 +39,7 @@ public class OutboxRelay {
     private final long sendBudgetNanos;
 
     public OutboxRelay(KafkaTemplate<String, String> kafka, OutboxRelayStore store,
-                       @Value("${flashorder.outbox-relay.batch-size:20}") int batchSize,
+                       @Value(BATCH_SIZE_PROPERTY) int batchSize,
                        @Value("${flashorder.outbox-relay.lease-ms:30000}") int leaseMs) {
         Map<String, Object> producer = kafka.getProducerFactory().getConfigurationProperties();
         Map<String, Object> defaults = ProducerConfig.configDef().defaultValues();
@@ -56,12 +57,12 @@ public class OutboxRelay {
     }
 
     @Transactional(propagation = Propagation.NEVER)
-    public int publishBatch() {
+    public BatchResult publishBatch() {
         // Measuring before claim gives a conservative local deadline for the database lease.
         long ackDeadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(leaseMs - MARK_RESERVE_MS);
         ClaimedBatch batch = store.claimBatch(batchSize, leaseMs);
         if (batch.messages().isEmpty()) {
-            return 0;
+            return new BatchResult(0, 0);
         }
 
         Map<Long, CompletableFuture<SendResult<String, String>>> sends = new LinkedHashMap<>();
@@ -82,7 +83,8 @@ public class OutboxRelay {
                     batch.messages().size() - acknowledgedIds.size(), batch.messages().size());
         }
         // The compare-and-set protects any rows that another relay reclaimed while this worker was delayed.
-        return acknowledgedIds.isEmpty() ? 0 : store.markPublished(batch.leaseToken(), acknowledgedIds);
+        int published = acknowledgedIds.isEmpty() ? 0 : store.markPublished(batch.leaseToken(), acknowledgedIds);
+        return new BatchResult(batch.messages().size(), published);
     }
 
     private static List<Long> awaitAcknowledgements(Map<Long, CompletableFuture<SendResult<String, String>>> sends,
@@ -104,5 +106,8 @@ public class OutboxRelay {
 
     private static long producerMillis(Map<String, Object> producer, Map<String, Object> defaults, String name) {
         return Long.parseLong(producer.getOrDefault(name, defaults.get(name)).toString());
+    }
+
+    public record BatchResult(int claimed, int published) {
     }
 }

@@ -44,7 +44,9 @@ $env:FLASHORDER_INTAKE_MODE = 'async'
 
 Kafka 默认绑定 `127.0.0.1:19092`。下单接口受理成功返回 `202`，用同一个 `X-User-Id` 轮询响应的 `Location`。查询到 `ORDER_CREATED` 后，可以按上面的示例支付。若返回 `SYSTEM_FAILED`，原幂等键重放返回 `409 REQUEST_FAILED`，换键可以重新提交。
 
-使用 `api`、`scheduler`、`consumer` profile 可分别启动三个进程，后台角色不开 HTTP。API 在 Kafka 暂时不可用时仍能持久化受理。Relay 默认每 250 ms 领取最多 20 条消息，租约为 30 秒。改用外部 Kafka 时设置 `FLASHORDER_KAFKA_BOOTSTRAP`。若外部集群禁用客户端建主题，请预建 `flashorder.order-commands`、`flashorder.order-events` 和 `flashorder.order-commands.DLT`，各 6 个分区。
+使用 `api`、`scheduler`、`consumer` profile 可分别启动三个进程，后台角色不开 HTTP。API 在 Kafka 暂时不可用时仍能持久化受理。改用外部 Kafka 时设置 `FLASHORDER_KAFKA_BOOTSTRAP`。若外部集群禁用客户端建主题，请预建 `flashorder.order-commands`、`flashorder.order-events` 和 `flashorder.order-commands.DLT`，各 6 个分区。
+
+Relay 默认每批领取 100 条。满批全部确认后立即处理下一批，直到取到短批、批次未全部确认，或本轮累计达到 1 秒。已领取的批次按 30 秒租约处理，轮次结束后等待 250 ms 再检查。分别用 `flashorder.outbox-relay.batch-size`、`flashorder.outbox-relay.max-round-ms`、`flashorder.outbox-relay.lease-ms` 和 `flashorder.outbox-relay.fixed-delay-ms` 调整。
 
 ## 升级用过旧种子迁移的 M1 数据库
 
