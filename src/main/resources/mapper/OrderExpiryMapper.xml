@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.flashorder.order.OrderExpiryMapper">
+    <resultMap id="expiredOrder" type="com.flashorder.order.OrderExpiryMapper$ExpiredOrder">
+        <constructor>
+            <arg column="id" javaType="_long"/>
+            <arg column="order_uid" javaType="string"/>
+            <arg column="request_uid" javaType="string"/>
+            <arg column="campaign_id" javaType="_long"/>
+            <arg column="user_id" javaType="_long"/>
+        </constructor>
+    </resultMap>
+
+    <select id="lockExpiredBatch" resultMap="expiredOrder">
+        <!-- The request UID is immutable. Its subquery is a non-locking read. -->
+        SELECT o.id, o.order_uid,
+               (SELECT r.request_uid FROM purchase_request r WHERE r.id = o.request_id) AS request_uid,
+               o.campaign_id, o.user_id
+        FROM purchase_order o FORCE INDEX (idx_purchase_order_status_expire)
+        WHERE o.status = 'PENDING' AND o.expire_at &lt;= NOW(6)
+        ORDER BY o.expire_at, o.id
+        LIMIT #{batchSize}
+        FOR UPDATE SKIP LOCKED
+    </select>
+
+    <update id="cancelOrders">
+        UPDATE purchase_order FORCE INDEX (PRIMARY)
+        SET status = 'CANCELLED', cancelled_at = NOW(6)
+        WHERE status = 'PENDING' AND id IN
+        <foreach collection="orderIds" item="id" open="(" separator="," close=")">
+            #{id}
+        </foreach>
+    </update>
+
+    <update id="restoreStock">
+        UPDATE inventory
+        SET available = available + #{quantity}
+        WHERE campaign_id = #{campaignId} AND available &lt;= total - #{quantity}
+    </update>
+</mapper>

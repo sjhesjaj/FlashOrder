@@ -6,6 +6,7 @@ spring:
     group:
       dev:
         - api
+        - scheduler
   datasource:
     url: "${FLASHORDER_DB_URL:jdbc:mysql://127.0.0.1:13306/flashorder}"
     username: ${FLASHORDER_DB_USER:flashorder}
@@ -38,3 +39,11 @@ management:
     distribution:
       percentiles-histogram:
         http.server.requests: true
+
+---
+spring:
+  config:
+    activate:
+      on-profile: "scheduler & !api"
+  main:
+    web-application-type: none
