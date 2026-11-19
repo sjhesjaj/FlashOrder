@@ -7,6 +7,7 @@ spring:
       dev:
         - api
         - scheduler
+        - consumer
   datasource:
     url: "${FLASHORDER_DB_URL:jdbc:mysql://127.0.0.1:13306/flashorder}"
     username: ${FLASHORDER_DB_USER:flashorder}
@@ -18,6 +19,31 @@ spring:
         forceConnectionTimeZoneToSession: "true"
         # Change isolation and autocommit through JDBC APIs so the driver's cache stays accurate.
         useLocalSessionState: "true"
+  kafka:
+    bootstrap-servers: ${FLASHORDER_KAFKA_BOOTSTRAP:127.0.0.1:19092}
+    producer:
+      acks: all
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+      properties:
+        enable.idempotence: true
+        max.block.ms: 1000
+        request.timeout.ms: 3000
+        delivery.timeout.ms: 5000
+    consumer:
+      group-id: flashorder-order-workers
+      enable-auto-commit: false
+      auto-offset-reset: earliest
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      properties:
+        allow.auto.create.topics: false
+    listener:
+      ack-mode: record
+  task:
+    scheduling:
+      pool:
+        size: 2
 
 mybatis:
   mapper-locations: classpath*:mapper/*.xml
@@ -28,7 +54,7 @@ server:
   address: 127.0.0.1
 
 flashorder:
-  intake-mode: sync
+  intake-mode: "${FLASHORDER_INTAKE_MODE:sync}"
 
 management:
   endpoints:
@@ -44,6 +70,6 @@ management:
 spring:
   config:
     activate:
-      on-profile: "scheduler & !api"
+      on-profile: "(scheduler | consumer) & !api"
   main:
     web-application-type: none
