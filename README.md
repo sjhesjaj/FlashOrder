@@ -22,6 +22,25 @@ curl.exe -i -X POST http://127.0.0.1:8080/campaigns/1/purchase-requests -H 'X-Us
 
 `/actuator/health` 提供健康状态。`/actuator/prometheus` 输出 HTTP 延迟直方图、连接池指标与 `flashorder_purchase_submissions_total`，可查看成功、拒绝与重放。
 
+## 升级用过旧种子迁移的 M1 数据库
+
+从旧版本更新代码后，首次启动前先执行 `.\mvnw.cmd clean`，清理旧构建产物里的迁移脚本。
+
+如果旧库执行过 `R__dev_seed.sql`（包括 `DO 0` 占位版本），先停掉连接该库的 FlashOrder 实例，再用 Flyway 做一次校验和修复。下列命令使用 Compose 的默认连接参数。自定义数据库请改用实际连接参数。
+
+```powershell
+$flywayLocal = @(
+  '-Dflyway.url=jdbc:mysql://127.0.0.1:13306/flashorder'
+  '-Dflyway.user=flashorder'
+  '-Dflyway.password=flashorder'
+)
+.\mvnw.cmd org.flywaydb:flyway-maven-plugin:validate @flywayLocal
+# 只有当唯一的校验错误是找不到 dev seed 时，才运行下一条。
+.\mvnw.cmd org.flywaydb:flyway-maven-plugin:repair @flywayLocal
+```
+
+`repair` 会为 `dev seed` 追加一条删除标记，保留已有订单和库存。修复成功后直接启动应用，全新数据库可跳过这一步。
+
 ## M1 集成测试
 
 ```powershell
