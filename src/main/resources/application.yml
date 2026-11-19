@@ -1,0 +1,35 @@
+spring:
+  application:
+    name: flashorder
+  profiles:
+    default: api
+    group:
+      dev:
+        - api
+  datasource:
+    url: "${FLASHORDER_DB_URL:jdbc:mysql://127.0.0.1:13306/flashorder?connectionTimeZone=UTC&forceConnectionTimeZoneToSession=true}"
+    username: ${FLASHORDER_DB_USER:flashorder}
+    password: ${FLASHORDER_DB_PASSWORD:flashorder}
+    hikari:
+      transaction-isolation: TRANSACTION_READ_COMMITTED
+
+mybatis:
+  mapper-locations: classpath*:mapper/*.xml
+  configuration:
+    local-cache-scope: STATEMENT
+
+server:
+  address: 127.0.0.1
+
+flashorder:
+  intake-mode: sync
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,prometheus
+  metrics:
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true

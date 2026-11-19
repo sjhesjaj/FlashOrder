@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.flashorder.outbox.OutboxMapper">
+    <insert id="insertOrderCreated">
+        INSERT INTO outbox_message (event_id, topic, msg_key, event_type, payload, created_at)
+        VALUES (#{eventId}, 'flashorder.order-events', #{orderUid}, 'ORDER_CREATED',
+                JSON_OBJECT('eventId', #{eventId}, 'eventType', 'ORDER_CREATED', 'orderUid', #{orderUid},
+                            'requestUid', #{requestUid}, 'campaignId', #{campaignId}, 'userId', #{userId}),
+                NOW(6))
+    </insert>
+</mapper>

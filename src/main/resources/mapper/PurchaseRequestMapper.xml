@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.flashorder.request.PurchaseRequestMapper">
+    <resultMap id="storedRequest" type="com.flashorder.request.PurchaseRequestMapper$StoredPurchaseRequest">
+        <constructor>
+            <arg column="campaign_id" javaType="_long"/>
+            <arg column="request_uid" javaType="string"/>
+            <arg column="status" javaType="string"/>
+            <arg column="reject_reason" javaType="string"/>
+            <arg column="order_uid" javaType="string"/>
+        </constructor>
+    </resultMap>
+
+    <sql id="requestResult">
+        SELECT r.campaign_id, r.request_uid, r.status, r.reject_reason, o.order_uid
+        FROM purchase_request AS r
+        LEFT JOIN purchase_order AS o ON o.id = r.order_id
+    </sql>
+
+    <select id="findByKey" resultMap="storedRequest">
+        <include refid="requestResult"/>
+        WHERE r.user_id = #{userId} AND r.idempotency_key = #{idempotencyKey}
+    </select>
+
+    <select id="findOwned" resultMap="storedRequest">
+        <include refid="requestResult"/>
+        WHERE r.user_id = #{userId} AND r.request_uid = #{requestUid}
+    </select>
+
+    <insert id="insertIfCampaignOpen">
+        INSERT INTO purchase_request (request_uid, user_id, campaign_id, idempotency_key, status, accepted_at)
+        SELECT #{requestUid}, #{userId}, c.id, #{idempotencyKey}, 'ACCEPTED', NOW(6)
+        FROM campaign AS c
+        WHERE c.id = #{campaignId} AND NOW(6) &gt;= c.starts_at AND NOW(6) &lt; c.ends_at
+    </insert>
+
+    <select id="lockIdByUid" resultType="_long">
+        SELECT id FROM purchase_request WHERE request_uid = #{requestUid} FOR UPDATE
+    </select>
+
+    <update id="markCreated">
+        UPDATE purchase_request AS r
+        JOIN purchase_order AS o ON o.request_id = r.id
+        SET r.status = 'ORDER_CREATED', r.order_id = o.id, r.finished_at = NOW(6)
+        WHERE r.id = #{requestId} AND r.status = 'ACCEPTED'
+    </update>
+
+    <update id="markRejected">
+        UPDATE purchase_request
+        SET status = 'REJECTED', reject_reason = #{reason}, finished_at = NOW(6)
+        WHERE id = #{requestId} AND status = 'ACCEPTED'
+    </update>
+</mapper>

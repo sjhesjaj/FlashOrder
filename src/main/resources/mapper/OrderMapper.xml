@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.flashorder.order.OrderMapper">
+    <resultMap id="orderView" type="com.flashorder.order.OrderView">
+        <constructor>
+            <arg column="order_uid" javaType="string"/>
+            <arg column="status" javaType="string"/>
+            <arg column="expire_at" javaType="java.time.LocalDateTime"/>
+        </constructor>
+    </resultMap>
+
+    <insert id="insertPending">
+        INSERT INTO purchase_order (order_uid, request_id, campaign_id, user_id, status, created_at, expire_at)
+        VALUES (#{orderUid}, #{requestId}, #{campaignId}, #{userId}, 'PENDING', NOW(6), NOW(6) + INTERVAL 15 MINUTE)
+    </insert>
+
+    <select id="findOwnedOrder" resultMap="orderView">
+        SELECT order_uid, status, expire_at
+        FROM purchase_order
+        WHERE order_uid = #{orderUid} AND user_id = #{userId}
+    </select>
+</mapper>
