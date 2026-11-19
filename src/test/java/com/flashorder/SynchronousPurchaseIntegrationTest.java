@@ -1,6 +1,7 @@
 package com.flashorder;
 
 import com.flashorder.inventory.InventoryMapper;
+import com.zaxxer.hikari.HikariDataSource;
 import org.aopalliance.intercept.MethodInterceptor;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -19,10 +20,12 @@ import org.testcontainers.mysql.MySQLContainer;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.json.JsonMapper;
 
+import javax.sql.DataSource;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.sql.Connection;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
@@ -37,7 +40,11 @@ import java.util.function.IntFunction;
 import static org.assertj.core.api.Assertions.assertThat;
 
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
-        properties = "flashorder.intake-mode=sync")
+        properties = {
+                "flashorder.intake-mode=sync",
+                "spring.datasource.hikari.connection-init-sql=SET SESSION innodb_lock_wait_timeout=10",
+                "spring.datasource.hikari.connection-timeout=10000"
+        })
 @Import(SynchronousPurchaseIntegrationTest.FaultConfiguration.class)
 class SynchronousPurchaseIntegrationTest {
 
@@ -57,6 +64,9 @@ class SynchronousPurchaseIntegrationTest {
 
     @Autowired
     private JdbcTemplate jdbc;
+
+    @Autowired
+    private DataSource dataSource;
 
     @Autowired
     private ReservationFault reservationFault;
@@ -200,6 +210,100 @@ class SynchronousPurchaseIntegrationTest {
     }
 
     @Test
+    void fortyIdenticalPurchasesConvergeAfterOneReservationRollsBack() throws Exception {
+        long campaign = activeCampaign(1);
+        long eventCount = orderCreatedEvents();
+        String key = "concurrent-retry-after-rollback";
+
+        reservationFault.arm(campaign);
+        List<Reply> replies;
+        try {
+            replies = submitConcurrently(40, index -> purchase(campaign, USER, key));
+            assertThat(reservationFault.isArmed()).isFalse();
+        } finally {
+            reservationFault.disarm();
+        }
+
+        assertThat(replies).extracting(Reply::httpStatus)
+                .allMatch(status -> status == 500 || status == 201 || status == 503);
+        assertThat(replies).filteredOn(reply -> reply.httpStatus() == 500).hasSize(1);
+        Reply retry = send(purchase(campaign, USER, key));
+        assertCreated(retry);
+
+        List<Reply> created = new ArrayList<>(replies.stream().filter(reply -> reply.httpStatus() == 201).toList());
+        created.add(retry);
+        for (Reply unavailable : replies.stream().filter(reply -> reply.httpStatus() == 503).toList()) {
+            assertRetryable(unavailable);
+            Reply replay = send(purchase(campaign, USER, key));
+            assertThat(replay.replayHeader()).isEqualTo("true");
+            created.add(replay);
+        }
+        assertThat(created).allSatisfy(reply -> {
+            assertCreated(reply);
+            assertThat(reply.field("requestUid")).isEqualTo(retry.field("requestUid"));
+            assertThat(reply.field("orderUid")).isEqualTo(retry.field("orderUid"));
+        });
+        assertThat(created).extracting(Reply::replayHeader).allMatch(header -> header == null || "true".equals(header));
+        assertThat(created).filteredOn(reply -> reply.replayHeader() == null).hasSize(1);
+        assertCampaign(campaign, 0, 1, 1);
+        assertThat(orderCreatedEvents()).isEqualTo(eventCount + 1);
+    }
+
+    @Test
+    void inventoryLockTimeoutIsRetryableAndLeavesNoCommittedWrites() throws Exception {
+        long campaign = activeCampaign(1);
+        long eventCount = orderCreatedEvents();
+        String key = "inventory-lock-timeout";
+
+        try (var blocker = dataSource.getConnection()) {
+            blocker.setAutoCommit(false);
+            try (var lock = blocker.prepareStatement("SELECT available FROM inventory WHERE campaign_id = ? FOR UPDATE")) {
+                lock.setLong(1, campaign);
+                try (var rows = lock.executeQuery()) {
+                    assertThat(rows.next()).isTrue();
+                }
+
+                assertRetryable(send(purchase(campaign, USER, key)));
+            } finally {
+                blocker.rollback();
+            }
+        }
+
+        assertCampaign(campaign, 1, 0, 0);
+        assertThat(orderCreatedEvents()).isEqualTo(eventCount);
+
+        Reply retry = send(purchase(campaign, USER, key));
+        assertCreated(retry);
+        assertThat(retry.replayHeader()).isNull();
+        assertCampaign(campaign, 0, 1, 1);
+        assertThat(orderCreatedEvents()).isEqualTo(eventCount + 1);
+    }
+
+    @Test
+    void exhaustedConnectionPoolIsRetryableAndDoesNotConsumeTheKey() throws Exception {
+        long campaign = activeCampaign(1);
+        String key = "connection-pool-timeout";
+        HikariDataSource pool = dataSource.unwrap(HikariDataSource.class);
+        List<Connection> connections = new ArrayList<>();
+        try {
+            for (int index = 0; index < pool.getMaximumPoolSize(); index++) {
+                connections.add(pool.getConnection());
+            }
+            assertRetryable(send(purchase(campaign, USER, key)));
+        } finally {
+            for (Connection connection : connections) {
+                connection.close();
+            }
+        }
+
+        assertCampaign(campaign, 1, 0, 0);
+        Reply retry = send(purchase(campaign, USER, key));
+        assertCreated(retry);
+        assertThat(retry.replayHeader()).isNull();
+        assertCampaign(campaign, 0, 1, 1);
+    }
+
+    @Test
     void sameUserCannotReuseAKeyForAnotherCampaign() throws Exception {
         long original = activeCampaign(1);
         long other = activeCampaign(1);
@@ -309,7 +413,7 @@ class SynchronousPurchaseIntegrationTest {
     private Reply send(HttpRequest request) throws Exception {
         HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
         return new Reply(response.statusCode(), response.headers().firstValue("Idempotent-Replayed").orElse(null),
-                response.body());
+                response.headers().firstValue("Retry-After").orElse(null), response.body());
     }
 
     private List<Reply> submitConcurrently(int count, IntFunction<HttpRequest> requests) throws Exception {
@@ -378,12 +482,22 @@ class SynchronousPurchaseIntegrationTest {
         assertThat(reply.replayHeader()).isNull();
     }
 
+    private static void assertRetryable(Reply reply) {
+        assertThat(reply.httpStatus()).as(reply.body()).isEqualTo(503);
+        assertThat(reply.field("status")).isEqualTo("RETRYABLE");
+        assertThat(reply.field("reason")).isEqualTo("TEMPORARY_DATABASE_ERROR");
+        assertThat(reply.field("requestUid")).isNull();
+        assertThat(reply.field("orderUid")).isNull();
+        assertThat(reply.retryAfter()).isEqualTo("1");
+        assertThat(reply.replayHeader()).isNull();
+    }
+
     private static void assertUuidV7(String text) {
         assertThat(text).isNotBlank();
         assertThat(UUID.fromString(text).version()).isEqualTo(7);
     }
 
-    private record Reply(int httpStatus, String replayHeader, String body) {
+    private record Reply(int httpStatus, String replayHeader, String retryAfter, String body) {
         String field(String name) {
             if (body.isBlank()) {
                 return null;

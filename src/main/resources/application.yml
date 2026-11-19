@@ -12,6 +12,9 @@ spring:
     password: ${FLASHORDER_DB_PASSWORD:flashorder}
     hikari:
       transaction-isolation: TRANSACTION_READ_COMMITTED
+      data-source-properties:
+        # Change isolation and autocommit through JDBC APIs so the driver's cache stays accurate.
+        useLocalSessionState: "true"
 
 mybatis:
   mapper-locations: classpath*:mapper/*.xml

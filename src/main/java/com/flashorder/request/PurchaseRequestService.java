@@ -14,7 +14,6 @@ import java.util.regex.Pattern;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.TransactionStatus;
-import org.springframework.transaction.annotation.Isolation;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.interceptor.TransactionAspectSupport;
 
@@ -36,7 +35,7 @@ public class PurchaseRequestService {
         this.outbox = outbox;
     }
 
-    @Transactional(isolation = Isolation.READ_COMMITTED)
+    @Transactional
     public Submission submit(long campaignId, long userId, String idempotencyKey) {
         StoredPurchaseRequest existing = requests.findByKey(userId, idempotencyKey);
         if (existing != null) {
