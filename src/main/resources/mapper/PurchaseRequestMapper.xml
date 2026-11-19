@@ -28,22 +28,21 @@
         WHERE r.user_id = #{userId} AND r.request_uid = #{requestUid}
     </select>
 
-    <insert id="insertIfCampaignOpen">
+    <insert id="insertIfCampaignOpen" useGeneratedKeys="true" keyProperty="generatedKey.id" keyColumn="id">
         INSERT INTO purchase_request (request_uid, user_id, campaign_id, idempotency_key, status, accepted_at)
         SELECT #{requestUid}, #{userId}, c.id, #{idempotencyKey}, 'ACCEPTED', NOW(6)
         FROM campaign AS c
         WHERE c.id = #{campaignId} AND NOW(6) &gt;= c.starts_at AND NOW(6) &lt; c.ends_at
     </insert>
 
-    <select id="lockIdByUid" resultType="_long">
-        SELECT id FROM purchase_request WHERE request_uid = #{requestUid} FOR UPDATE
+    <select id="campaignExists" resultType="_boolean">
+        SELECT EXISTS (SELECT 1 FROM campaign WHERE id = #{campaignId})
     </select>
 
     <update id="markCreated">
-        UPDATE purchase_request AS r
-        JOIN purchase_order AS o ON o.request_id = r.id
-        SET r.status = 'ORDER_CREATED', r.order_id = o.id, r.finished_at = NOW(6)
-        WHERE r.id = #{requestId} AND r.status = 'ACCEPTED'
+        UPDATE purchase_request
+        SET status = 'ORDER_CREATED', order_id = #{orderId}, finished_at = NOW(6)
+        WHERE id = #{requestId} AND status = 'ACCEPTED'
     </update>
 
     <update id="markRejected">

@@ -1,15 +1,13 @@
 package com.flashorder.request;
 
+import com.flashorder.common.GeneratedKey;
 import com.flashorder.common.UuidV7;
 import com.flashorder.inventory.InventoryMapper;
 import com.flashorder.order.OrderMapper;
 import com.flashorder.outbox.OutboxMapper;
 import com.flashorder.request.PurchaseRequestMapper.StoredPurchaseRequest;
 
-import java.sql.SQLException;
 import java.util.Optional;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
@@ -19,9 +17,6 @@ import org.springframework.transaction.interceptor.TransactionAspectSupport;
 
 @Service
 public class PurchaseRequestService {
-    private static final Pattern MYSQL_DUPLICATE_KEY =
-            Pattern.compile("for key ['`](?:[^'`]+\\.)?([a-zA-Z0-9_]+)['`]\\s*$");
-
     private final PurchaseRequestMapper requests;
     private final OrderMapper orders;
     private final InventoryMapper inventory;
@@ -43,25 +38,29 @@ public class PurchaseRequestService {
         }
 
         String requestUid = UuidV7.next();
+        GeneratedKey requestKey = new GeneratedKey();
+        int inserted;
         try {
-            if (requests.insertIfCampaignOpen(campaignId, userId, idempotencyKey, requestUid) == 0) {
-                // A concurrent original submission may have committed as the campaign closed.
-                existing = requests.findByKey(userId, idempotencyKey);
-                return existing == null ? rejectUnaccepted("CAMPAIGN_CLOSED") : replay(campaignId, existing);
-            }
+            inserted = requests.insertIfCampaignOpen(campaignId, userId, idempotencyKey, requestUid, requestKey);
         } catch (DuplicateKeyException exception) {
-            if (isDuplicateKey(exception, "uk_purchase_request_idempotency")) {
-                // The winning transaction has committed by the time the duplicate is reported.
-                existing = requests.findByKey(userId, idempotencyKey);
-                if (existing != null) {
-                    return replay(campaignId, existing);
-                }
+            existing = requests.findByKey(userId, idempotencyKey);
+            if (existing != null) {
+                return replay(campaignId, existing);
             }
             throw exception;
         }
 
-        long requestId = requests.lockIdByUid(requestUid);
-        PurchaseResult result = attemptOrder(requestId, requestUid, campaignId, userId);
+        if (inserted == 0) {
+            boolean campaignExists = requests.campaignExists(campaignId);
+            // A concurrent submission may have committed while the campaign was closing.
+            existing = requests.findByKey(userId, idempotencyKey);
+            if (existing != null) {
+                return replay(campaignId, existing);
+            }
+            return rejectUnaccepted(campaignExists ? "CAMPAIGN_CLOSED" : "CAMPAIGN_NOT_FOUND");
+        }
+
+        PurchaseResult result = attemptOrder(requestKey.requireId(), requestUid, campaignId, userId);
         return new Submission(result, false);
     }
 
@@ -72,20 +71,22 @@ public class PurchaseRequestService {
 
     private PurchaseResult attemptOrder(long requestId, String requestUid, long campaignId, long userId) {
         TransactionStatus transaction = TransactionAspectSupport.currentTransactionStatus();
-        // Preserve the request and its uniqueness constraint while undoing a business rejection.
+        // The insert already holds the request row lock. Keep it if the order is rejected.
         Object savepoint = transaction.createSavepoint();
         String orderUid = UuidV7.next();
+        GeneratedKey orderKey = new GeneratedKey();
         try {
-            orders.insertPending(orderUid, requestId, campaignId, userId);
+            orders.insertPending(orderUid, requestId, campaignId, userId, orderKey);
         } catch (DuplicateKeyException exception) {
-            if (isDuplicateKey(exception, "uk_purchase_order_active")) {
+            // The failed insert retains the duplicate index lock during this verification.
+            if (orders.hasActiveOrderConflict(campaignId, userId, requestId, orderUid)) {
                 return rejectOrder(transaction, savepoint, requestId, requestUid, "ALREADY_HOLDING");
             }
             throw exception;
         }
 
         outbox.insertOrderCreated(UuidV7.next(), orderUid, requestUid, campaignId, userId);
-        if (requests.markCreated(requestId) != 1) {
+        if (requests.markCreated(requestId, orderKey.requireId()) != 1) {
             throw new IllegalStateException("Could not finish purchase request " + requestUid);
         }
         if (inventory.reserve(campaignId) == 0) {
@@ -111,15 +112,6 @@ public class PurchaseRequestService {
     }
 
     private static Submission rejectUnaccepted(String reason) {
-        return new Submission(new PurchaseResult(null, "REJECTED", reason, null), false);
-    }
-
-    private static boolean isDuplicateKey(DuplicateKeyException exception, String key) {
-        if (!(exception.getMostSpecificCause() instanceof SQLException sqlException)
-                || sqlException.getErrorCode() != 1062) {
-            return false;
-        }
-        Matcher matcher = MYSQL_DUPLICATE_KEY.matcher(sqlException.getMessage());
-        return matcher.find() && key.equals(matcher.group(1));
+        return new Submission(new PurchaseResult(null, "NOT_ACCEPTED", reason, null), false);
     }
 }

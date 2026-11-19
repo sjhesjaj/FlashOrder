@@ -1,5 +1,6 @@
 package com.flashorder.request;
 
+import com.flashorder.common.GeneratedKey;
 import org.apache.ibatis.annotations.Mapper;
 import org.apache.ibatis.annotations.Param;
 
@@ -13,11 +14,12 @@ public interface PurchaseRequestMapper {
     int insertIfCampaignOpen(@Param("campaignId") long campaignId,
                              @Param("userId") long userId,
                              @Param("idempotencyKey") String idempotencyKey,
-                             @Param("requestUid") String requestUid);
+                             @Param("requestUid") String requestUid,
+                             @Param("generatedKey") GeneratedKey generatedKey);
 
-    long lockIdByUid(@Param("requestUid") String requestUid);
+    boolean campaignExists(@Param("campaignId") long campaignId);
 
-    int markCreated(@Param("requestId") long requestId);
+    int markCreated(@Param("requestId") long requestId, @Param("orderId") long orderId);
 
     int markRejected(@Param("requestId") long requestId, @Param("reason") String reason);
 

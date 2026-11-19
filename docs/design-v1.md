@@ -17,7 +17,7 @@
 | 框架 | Spring Boot 4.1.2（固定补丁版本） | 3.x 的开源支持已于 2026-06-30 结束；4.1.x 的开源支持到 2027-07-31 |
 | 数据库 | MySQL 8.4 LTS，全局 `READ COMMITTED` | 理由见第二节 |
 | 数据访问 | MyBatis Spring Boot Starter 4.1.0，Mapper 接口 + XML 手写 SQL | 以 Spring Boot 4.1 为基线 |
-| 迁移 | Flyway | |
+| 迁移 | Flyway | `dev` 的活动和库存由启动任务初始化，重复启动保留已扣减库存 |
 | 消息 | Kafka，KRaft 单节点 | |
 | 缓存 | Redis 7 | 只做限流 |
 | 测试 | JUnit 5 + Testcontainers（MySQL、Kafka、Redis） | |
@@ -141,7 +141,7 @@ sequenceDiagram
 
 每个活动对应一个 SKU，独立分配库存，每单一件。支付期限 15 分钟，从订单创建起算。超时取消的用户，可以在活动仍开放时换一个新幂等键重试。
 
-**全局使用 `READ COMMITTED`**，理由有两个：
+**全局使用 `READ COMMITTED`**，由 MySQL 和 Hikari 配置。Connector/J 缓存 JDBC 会话状态，应用通过 JDBC API 修改事务隔离级别、只读状态和自动提交。使用该隔离级别的理由有两个：
 
 - 撞唯一键等待结束后，下一条语句能读到对方已提交的结果。在 `REPEATABLE READ` 下，快照在事务的第一次读取时就已固定，后面读不到。
 - 超时任务做范围扫描并加 `FOR UPDATE SKIP LOCKED` 时，不会加间隙锁挡住新订单插入。
@@ -192,11 +192,11 @@ erDiagram
 
 **整个建单在一个事务里完成，业务拒绝也在这个事务里提交。** 热点行放到最后更新，这样它的锁持有时间最短：
 
-1. 拿到请求行。async 模式下用 `SELECT ... FROM purchase_request WHERE id = ? FOR UPDATE` 锁住它；如果已是终态，说明是重投，直接结束。sync 模式下，它就是本事务在受理步骤里刚插入的那一行，同键的并发请求会卡在唯一键上，等本事务结束。
+1. 拿到请求行。async 模式下用 `SELECT ... FROM purchase_request WHERE id = ? FOR UPDATE` 锁住它；如果已是终态，说明是重投，直接结束。sync 模式下，它就是本事务在受理步骤里刚插入的那一行，通过 JDBC 生成键取得主键。同键的并发请求会卡在唯一键上，等本事务结束。
 2. 设保存点 `before_order`。
 3. 插入候选订单，状态 `PENDING`，`expire_at = NOW(6) + INTERVAL 15 MINUTE`。如果撞上 `(campaign_id, user_id, active_flag)` 唯一键，就回滚到保存点，把请求标成 `REJECTED(ALREADY_HOLDING)`，然后提交。
 4. 插入 outbox 事件 `ORDER_CREATED`。
-5. 把请求标成 `ORDER_CREATED`，关联 `order_id`。
+5. 用 JDBC 返回的订单主键，把请求标成 `ORDER_CREATED` 并关联 `order_id`。
 6. 执行 `UPDATE inventory SET available = available - 1 WHERE campaign_id = ? AND available >= 1`。
 7. 影响 1 行就提交。影响 0 行就回滚到保存点，撤销第 3–5 步写入的候选订单、事件和状态变更，再把请求标成 `REJECTED(SOLD_OUT)`，然后提交。
 
@@ -254,13 +254,13 @@ SELECT i.total, i.available,
 
 | 接口 | 成功 | 其他结果 |
 |---|---|---|
-| `POST /campaigns/{campaignId}/purchase-requests`（头：`X-User-Id`、`Idempotency-Key`） | 按请求当前状态返回（见下表），首次提交和重放用同一套规则 | 入口拒绝，不写记录：`409` `IDEMPOTENCY_CONFLICT` / `CAMPAIGN_CLOSED` / `SOLD_OUT`；`429` 限流；`503` 在途已满 |
+| `POST /campaigns/{campaignId}/purchase-requests`（头：`X-User-Id`、`Idempotency-Key`） | 按请求当前状态返回（见下表），首次提交和重放用同一套规则 | 入口拒绝，不写记录：`404 CAMPAIGN_NOT_FOUND`；`409` `IDEMPOTENCY_CONFLICT` / `CAMPAIGN_CLOSED` / `SOLD_OUT`；`429` 限流；`503` 数据库暂不可用或在途已满 |
 | `GET /purchase-requests/{requestUid}` | `200` + 状态、原因、`orderUid`；处理中时带 `Retry-After` | 不属于当前用户时返回 `404` |
-| `GET /orders/{orderUid}` | `200` + 订单状态、`expire_at` | `404` |
+| `GET /orders/{orderUid}` | `200` + 订单状态、UTC 时间 `expireAt` | `404` |
 | `POST /orders/{orderUid}/payments`（头：`Idempotency-Key`） | `200 PAID`（含重放） | `409` `ORDER_EXPIRED` / `ORDER_CANCELLED`；`404` |
 | `GET /admin/campaigns/{campaignId}/reconciliation` | `200` + 对账结果与差异 | |
 
-**提交接口的响应只由请求的当前状态决定**，首次提交和重放用同一套规则。只要请求写进了数据库，响应体就带 `requestUid`。入口快速拒绝不写记录，所以响应里没有 `requestUid`。
+**提交接口的响应只由请求的当前状态决定**，首次提交和重放用同一套规则。只要请求写进了数据库，响应体就带 `requestUid`。入口快速拒绝返回 `NOT_ACCEPTED` 和原因。数据库锁冲突、锁等待超时或连接获取超时返回 `503 RETRYABLE` 和 `Retry-After`，客户端用原幂等键重试。
 
 | 请求状态 | 响应 |
 |---|---|

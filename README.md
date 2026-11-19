@@ -12,13 +12,13 @@ docker compose up -d --wait
 .\mvnw.cmd spring-boot:run '-Dspring-boot.run.profiles=dev'
 ```
 
-应用绑定 `127.0.0.1:8080`，MySQL 绑定 `127.0.0.1:13306`。如果 PowerShell 里的 Java 版本不对，把当前终端的 `JAVA_HOME` 指到 JDK 21。开发配置自动建表，预置活动 `1` 和 50 件库存。调用时用 `X-User-Id` 模拟身份，例如 `1` 到 `200`。这些接口用于本地开发。
+应用绑定 `127.0.0.1:8080`，MySQL 绑定 `127.0.0.1:13306`。如果 PowerShell 里的 Java 版本不对，把当前终端的 `JAVA_HOME` 指到 JDK 21。Flyway 负责建表，`dev` 启动任务预置活动 `1` 和 50 件库存，重复启动保留已扣减库存。调用时用 `X-User-Id` 模拟身份，例如 `1` 到 `200`。这些接口用于本地开发。
 
 ```powershell
 curl.exe -i -X POST http://127.0.0.1:8080/campaigns/1/purchase-requests -H 'X-User-Id: 1' -H 'Idempotency-Key: example-m1'
 ```
 
-成功返回 `201` 和 `requestUid`、`orderUid`。重复执行同一条命令会返回相同结果，并带上 `Idempotent-Replayed: true`。库存不足和已持有订单返回 `409`，已持久化的拒绝同样可重放。可以用同一个 `X-User-Id` 请求 `GET /purchase-requests/{requestUid}` 和 `GET /orders/{orderUid}`。
+成功返回 `201` 和 `requestUid`、`orderUid`。重复执行同一条命令会返回相同结果，并带上 `Idempotent-Replayed: true`。库存不足和已持有订单返回 `409`，已持久化的拒绝同样可重放。入口拒绝返回 `NOT_ACCEPTED`，活动不存在返回 `404`。锁等待超时、死锁或连接池暂时无法分配连接时返回 `503` 和 `Retry-After`，按原幂等键重试。可以用同一个 `X-User-Id` 请求 `GET /purchase-requests/{requestUid}` 和 `GET /orders/{orderUid}`，订单到期时间 `expireAt` 以 UTC 返回。
 
 `/actuator/health` 提供健康状态。`/actuator/prometheus` 输出 HTTP 延迟直方图、连接池指标与 `flashorder_purchase_submissions_total`，可查看成功、拒绝与重放。
 

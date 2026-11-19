@@ -27,6 +27,9 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.sql.Connection;
 import java.time.Duration;
+import java.time.LocalDateTime;
+import java.time.OffsetDateTime;
+import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
@@ -312,7 +315,7 @@ class SynchronousPurchaseIntegrationTest {
         assertCreated(send(purchase(original, USER, key)));
         Reply conflict = send(purchase(other, USER, key));
 
-        assertEntryRejection(conflict, "IDEMPOTENCY_CONFLICT");
+        assertNotAccepted(conflict, 409, "IDEMPOTENCY_CONFLICT");
         assertCampaign(other, 1, 0, 0);
 
         Reply independent = send(purchase(other, OTHER_USER, key));
@@ -322,7 +325,21 @@ class SynchronousPurchaseIntegrationTest {
     }
 
     @Test
-    void requestAndOrderAreVisibleOnlyToTheOwner() throws Exception {
+    void missingCampaignReturnsNotFoundWithoutConsumingTheKey() throws Exception {
+        long campaign = activeCampaign(1);
+        String key = "missing-campaign";
+
+        Reply missing = send(purchase(Long.MAX_VALUE, USER, key));
+        assertNotAccepted(missing, 404, "CAMPAIGN_NOT_FOUND");
+
+        Reply available = send(purchase(campaign, USER, key));
+        assertCreated(available);
+        assertThat(available.replayHeader()).isNull();
+        assertCampaign(campaign, 0, 1, 1);
+    }
+
+    @Test
+    void ownerCanReadRequestAndOrderWithAnUnambiguousUtcDeadline() throws Exception {
         Reply created = send(purchase(activeCampaign(1), USER, "ownership"));
         assertCreated(created);
 
@@ -336,6 +353,12 @@ class SynchronousPurchaseIntegrationTest {
         assertThat(request.field("orderUid")).isEqualTo(created.field("orderUid"));
         assertThat(order.httpStatus()).isEqualTo(200);
         assertThat(order.field("status")).isEqualTo("PENDING");
+        LocalDateTime storedExpiry = jdbc.queryForObject("SELECT expire_at FROM purchase_order WHERE order_uid = ?",
+                LocalDateTime.class, created.field("orderUid"));
+        assertThat(order.field("expireAt")).isNotBlank();
+        OffsetDateTime expiry = OffsetDateTime.parse(order.field("expireAt"));
+        assertThat(expiry.getOffset()).isEqualTo(ZoneOffset.UTC);
+        assertThat(expiry.toLocalDateTime()).isEqualTo(storedExpiry);
         assertThat(send(query(requestPath, OTHER_USER)).httpStatus()).isEqualTo(404);
         assertThat(send(query(orderPath, OTHER_USER)).httpStatus()).isEqualTo(404);
     }
@@ -350,8 +373,8 @@ class SynchronousPurchaseIntegrationTest {
 
         jdbc.update("UPDATE campaign SET ends_at = NOW(6) - INTERVAL 1 MINUTE WHERE id = ?", active);
 
-        assertEntryRejection(send(purchase(future, USER, "too-early")), "CAMPAIGN_CLOSED");
-        assertEntryRejection(send(purchase(active, OTHER_USER, "too-late")), "CAMPAIGN_CLOSED");
+        assertNotAccepted(send(purchase(future, USER, "too-early")), 409, "CAMPAIGN_CLOSED");
+        assertNotAccepted(send(purchase(active, OTHER_USER, "too-late")), 409, "CAMPAIGN_CLOSED");
         Reply replay = send(purchase(active, USER, originalKey));
 
         assertCreated(replay);
@@ -474,8 +497,9 @@ class SynchronousPurchaseIntegrationTest {
         assertUuidV7(reply.field("requestUid"));
     }
 
-    private static void assertEntryRejection(Reply reply, String reason) {
-        assertThat(reply.httpStatus()).as(reply.body()).isEqualTo(409);
+    private static void assertNotAccepted(Reply reply, int httpStatus, String reason) {
+        assertThat(reply.httpStatus()).as(reply.body()).isEqualTo(httpStatus);
+        assertThat(reply.field("status")).isEqualTo("NOT_ACCEPTED");
         assertThat(reply.field("reason")).isEqualTo(reason);
         assertThat(reply.field("requestUid")).isNull();
         assertThat(reply.field("orderUid")).isNull();

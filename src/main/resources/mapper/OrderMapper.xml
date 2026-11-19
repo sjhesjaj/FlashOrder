@@ -10,10 +10,19 @@
         </constructor>
     </resultMap>
 
-    <insert id="insertPending">
+    <insert id="insertPending" useGeneratedKeys="true" keyProperty="generatedKey.id" keyColumn="id">
         INSERT INTO purchase_order (order_uid, request_id, campaign_id, user_id, status, created_at, expire_at)
         VALUES (#{orderUid}, #{requestId}, #{campaignId}, #{userId}, 'PENDING', NOW(6), NOW(6) + INTERVAL 15 MINUTE)
     </insert>
+
+    <select id="hasActiveOrderConflict" resultType="_boolean">
+        SELECT EXISTS (
+            SELECT 1 FROM purchase_order
+            WHERE campaign_id = #{campaignId} AND user_id = #{userId} AND active_flag = 1
+        )
+        AND NOT EXISTS (SELECT 1 FROM purchase_order WHERE request_id = #{requestId})
+        AND NOT EXISTS (SELECT 1 FROM purchase_order WHERE order_uid = #{orderUid})
+    </select>
 
     <select id="findOwnedOrder" resultMap="orderView">
         SELECT order_uid, status, expire_at

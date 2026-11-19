@@ -1,10 +1,5 @@
-package com.flashorder.common.web;
+package com.flashorder.request;
 
-import com.flashorder.order.OrderMapper;
-import com.flashorder.order.OrderView;
-import com.flashorder.request.PurchaseRequestService;
-import com.flashorder.request.PurchaseResult;
-import com.flashorder.request.Submission;
 import io.micrometer.core.instrument.MeterRegistry;
 import java.net.URI;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
@@ -21,15 +16,13 @@ import org.springframework.web.server.ResponseStatusException;
 @RestController
 @Profile("api")
 @ConditionalOnProperty(prefix = "flashorder", name = "intake-mode", havingValue = "sync")
-public class PurchaseController {
+public class PurchaseRequestController {
 
     private final PurchaseRequestService requests;
-    private final OrderMapper orders;
     private final MeterRegistry meters;
 
-    public PurchaseController(PurchaseRequestService requests, OrderMapper orders, MeterRegistry meters) {
+    public PurchaseRequestController(PurchaseRequestService requests, MeterRegistry meters) {
         this.requests = requests;
-        this.orders = orders;
         this.meters = meters;
     }
 
@@ -58,6 +51,8 @@ public class PurchaseController {
         ResponseEntity.BodyBuilder response = switch (result.status()) {
             case "ORDER_CREATED" -> ResponseEntity.created(URI.create("/orders/" + result.orderUid()));
             case "REJECTED" -> ResponseEntity.status(HttpStatus.CONFLICT);
+            case "NOT_ACCEPTED" -> ResponseEntity.status("CAMPAIGN_NOT_FOUND".equals(result.reason())
+                    ? HttpStatus.NOT_FOUND : HttpStatus.CONFLICT);
             default -> throw new IllegalStateException("Unexpected synchronous purchase result: " + result.status());
         };
         if (submission.replayed()) {
@@ -71,13 +66,6 @@ public class PurchaseController {
             @PathVariable String requestUid, @RequestHeader("X-User-Id") long userId) {
         requireUser(userId);
         return ResponseEntity.of(requests.find(userId, requestUid));
-    }
-
-    @GetMapping("/orders/{orderUid}")
-    public ResponseEntity<OrderView> findOrder(
-            @PathVariable String orderUid, @RequestHeader("X-User-Id") long userId) {
-        requireUser(userId);
-        return ResponseEntity.ofNullable(orders.findOwnedOrder(userId, orderUid));
     }
 
     private static void requireUser(long userId) {

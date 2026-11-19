@@ -7,12 +7,14 @@ spring:
       dev:
         - api
   datasource:
-    url: "${FLASHORDER_DB_URL:jdbc:mysql://127.0.0.1:13306/flashorder?connectionTimeZone=UTC&forceConnectionTimeZoneToSession=true}"
+    url: "${FLASHORDER_DB_URL:jdbc:mysql://127.0.0.1:13306/flashorder}"
     username: ${FLASHORDER_DB_USER:flashorder}
     password: ${FLASHORDER_DB_PASSWORD:flashorder}
     hikari:
       transaction-isolation: TRANSACTION_READ_COMMITTED
       data-source-properties:
+        connectionTimeZone: UTC
+        forceConnectionTimeZoneToSession: "true"
         # Change isolation and autocommit through JDBC APIs so the driver's cache stays accurate.
         useLocalSessionState: "true"
 
