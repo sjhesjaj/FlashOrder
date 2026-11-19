@@ -32,8 +32,8 @@
 ```
 com.flashorder
 ├─ request     受理、入口检查、请求查询
-├─ order       建单用例、模拟支付、超时取消、对账
-├─ inventory   库存扣减与归还、售罄缓存
+├─ order       建单用例、模拟支付、超时取消
+├─ inventory   库存变更、对账、售罄缓存
 ├─ outbox      outbox 写入、Relay
 └─ common      配置、Web、错误码、ID、指标
 ```
@@ -50,7 +50,7 @@ com.flashorder
 | `consumer` | Kafka 监听、建单用例 |
 | `scheduler` | 超时取消、Outbox Relay（两者都是定时轮询数据库的后台任务） |
 
-本地开发时三个 profile 同时开在一个进程里，压测时拆成独立进程。
+M2 的本地 `dev` 配置组合启用 `api` 和 `scheduler`。单独启用 `scheduler` 时进程只执行后台任务。M3 接入 `consumer` 后，本地可在一个进程里启用三个角色，压测时再拆成独立进程。
 
 **受理模式开关：** `flashorder.intake-mode=sync|async`。`sync` 是 M1 的同步基线，在 HTTP 线程里把受理和建单放进同一个事务。`async` 走 Kafka。两种模式调用同一个建单用例，方便做同负载对比。
 
@@ -208,25 +208,27 @@ erDiagram
 
 ### 2.3 模拟支付
 
-`POST /orders/{orderUid}/payments`，带 `Idempotency-Key`。同一个事务里：
+`POST /orders/{orderUid}/payments` 使用与建单相同的 `X-User-Id`、`Idempotency-Key`。一次支付由一个事务完成。
 
 1. `SELECT ... FROM purchase_order WHERE order_uid = ? AND user_id = ? FOR UPDATE`。
-2. 如果已有同一 `(order_id, idempotency_key)` 的支付记录，返回原结果。
-3. 订单已是 `PAID` 就返回已支付。已是 `CANCELLED` 就记一条 `REJECTED_CANCELLED`，返回 `409`。
-4. 订单是 `PENDING` 且 `NOW(6) < expire_at` 时，改为 `PAID`，写支付记录和 `ORDER_PAID` 事件。否则记一条 `REJECTED_EXPIRED`，返回 `409`，取消留给超时任务处理。
+2. 如果已有同一 `(order_id, idempotency_key)` 的支付记录，返回原响应体和状态码，另带 `Idempotent-Replayed: true`。
+3. 订单已是 `PAID` 就记录 `ALREADY_PAID` 并返回原支付时间。已是 `CANCELLED` 就记录 `REJECTED_CANCELLED`，返回 `409`。
+4. 订单是 `PENDING` 时另发一条带 `NOW(6) < expire_at` 的条件更新。更新成功则改为 `PAID`，记录 `SUCCEEDED`，写入 `ORDER_PAID` 事件。更新零行则记录 `REJECTED_EXPIRED`，返回 `409`，由超时任务取消订单。
 
-整个过程不碰库存行。真实扣款和退款留到后续版本。
+MySQL 在每条语句开始时取一次 `NOW(6)`。支付在拿到订单锁后才发条件更新，排队等锁跨过截止时间的请求会被拒绝。支付只更新订单、支付记录和 Outbox，`available` 保持原值。 [MySQL 时间函数](https://dev.mysql.com/doc/refman/8.4/en/date-and-time-functions.html)
 
 ### 2.4 超时取消（scheduler）
 
 每批一个事务：
 
-1. `SELECT id, campaign_id FROM purchase_order WHERE status = 'PENDING' AND expire_at <= NOW(6) ORDER BY expire_at LIMIT 200 FOR UPDATE SKIP LOCKED`。
+1. `SELECT id, campaign_id FROM purchase_order WHERE status = 'PENDING' AND expire_at <= NOW(6) ORDER BY expire_at, id LIMIT ? FOR UPDATE SKIP LOCKED`。
 2. 批量改为 `CANCELLED`。`active_flag` 随之变成 NULL，资格同时释放。为每单写 `ORDER_CANCELLED` 事件。
 3. 按 `campaign_id` 升序执行 `UPDATE inventory SET available = available + n`。顺序固定是为了避免死锁。
 4. 提交。
 
-和支付竞争时：支付先拿到锁，这一批就跳过这单；支付成功后，这单不再满足查询条件。超时任务先拿到锁，支付会等它提交，然后看到 `CANCELLED`，拒绝支付。截止前允许支付，到达截止时间就可以取消，中间没有空档。 [MySQL 时间函数](https://dev.mysql.com/doc/refman/8.0/en/date-and-time-functions.html)
+`flashorder.order-expiry.batch-size` 默认 200，`flashorder.order-expiry.fixed-delay-ms` 默认 1000。一轮调度分批处理，每批独立提交后计入取消数量，直到一批取不到订单。
+
+和支付竞争时，支付先拿到锁，这一批会跳过该订单。支付成功后，订单退出候选范围。取消先拿到锁时，支付等待提交，然后读到 `CANCELLED` 并拒绝。截止前允许支付，到达截止时间后允许取消。 [MySQL 锁定读取](https://dev.mysql.com/doc/refman/8.4/en/innodb-locking-reads.html)
 
 ### 2.5 不变量与对账
 
@@ -236,7 +238,7 @@ erDiagram
 4. 一个请求最多一个订单，由唯一索引保证。
 5. `ORDER_CREATED` 状态的请求都有订单，`ACCEPTED` 和 `REJECTED` 状态的请求都没有订单。
 
-对账用一条 SQL 读完，在 `READ COMMITTED` 下一条语句只用一个读视图，所以库存和订单数来自同一个快照：
+库存对账使用以下 SQL。在 `READ COMMITTED` 下，一条语句使用同一个读视图，库存和订单数来自同一个快照。
 
 ```sql
 SELECT i.total, i.available,
@@ -248,7 +250,7 @@ SELECT i.total, i.available,
  WHERE i.campaign_id = ?;
 ```
 
-发现差异时只报告，不自动修正。
+`gap = total - available - pending - paid`。另一条查询用 `purchase_order.request_id` 核对请求与订单的对应关系，统计 `createdWithoutOrder` 与 `nonCreatedWithOrder`。两条查询分别取读视图，响应注明 `sameSnapshot: false`。三个差异值都为零时 `consistent` 为 `true`。对账只读并报告差异。
 
 ## 三、接口
 
@@ -257,8 +259,8 @@ SELECT i.total, i.available,
 | `POST /campaigns/{campaignId}/purchase-requests`（头：`X-User-Id`、`Idempotency-Key`） | 按请求当前状态返回（见下表），首次提交和重放用同一套规则 | 入口拒绝，不写记录：`404 CAMPAIGN_NOT_FOUND`；`409` `IDEMPOTENCY_CONFLICT` / `CAMPAIGN_CLOSED` / `SOLD_OUT`；`429` 限流；`503` 数据库暂不可用或在途已满 |
 | `GET /purchase-requests/{requestUid}` | `200` + 状态、原因、`orderUid`；处理中时带 `Retry-After` | 不属于当前用户时返回 `404` |
 | `GET /orders/{orderUid}` | `200` + 订单状态、UTC 时间 `expireAt` | `404` |
-| `POST /orders/{orderUid}/payments`（头：`Idempotency-Key`） | `200 PAID`（含重放） | `409` `ORDER_EXPIRED` / `ORDER_CANCELLED`；`404` |
-| `GET /admin/campaigns/{campaignId}/reconciliation` | `200` + 对账结果与差异 | |
+| `POST /orders/{orderUid}/payments`（头 `X-User-Id`、`Idempotency-Key`） | `200`，包含 `orderUid`、`status: PAID`、UTC `paidAt` | `409`，包含 `orderUid`、`status: REJECTED`、`reason: ORDER_EXPIRED` / `ORDER_CANCELLED`。订单不存在或属于他人时返回 `404` |
+| `GET /admin/campaigns/{campaignId}/reconciliation` | `200`，包含库存差额、请求与订单差异和 `consistent` | 活动不存在时返回 `404` |
 
 **提交接口的响应只由请求的当前状态决定**，首次提交和重放用同一套规则。只要请求写进了数据库，响应体就带 `requestUid`。入口快速拒绝返回 `NOT_ACCEPTED` 和原因。数据库锁冲突、锁等待超时或连接获取超时返回 `503 RETRYABLE` 和 `Retry-After`，客户端用原幂等键重试。
 
@@ -282,6 +284,9 @@ SELECT i.total, i.available,
 - Hikari 连接池等待。
 - InnoDB 行锁等待（`Innodb_row_lock_waits`、`Innodb_row_lock_time`，由 mysqld-exporter 采集）。
 - 入口各类拒绝的计数：限流、售罄、在途已满、幂等冲突。
+- M2 支付次数 `flashorder.payments`，按 `result` 和 `replayed` 统计。
+- M2 已提交的超时取消订单数 `flashorder.orders.cancelled`。
+- M2 最近一次对账的库存差额 `flashorder.reconciliation.gap`，按 `campaign` 标签区分活动。
 
 ## 五、开发顺序和验收
 

@@ -16,7 +16,6 @@ import org.springframework.context.annotation.Import;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
-import org.testcontainers.mysql.MySQLContainer;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.json.JsonMapper;
 
@@ -81,20 +80,7 @@ class SynchronousPurchaseIntegrationTest {
 
     @DynamicPropertySource
     static void configureDatabase(DynamicPropertyRegistry registry) {
-        String externalUrl = System.getenv("FLASHORDER_TEST_JDBC_URL");
-        if (externalUrl != null && !externalUrl.isBlank()) {
-            registry.add("spring.datasource.url", () -> externalUrl);
-            registry.add("spring.datasource.username",
-                    () -> System.getenv().getOrDefault("FLASHORDER_TEST_DB_USER", "flashorder"));
-            registry.add("spring.datasource.password",
-                    () -> System.getenv().getOrDefault("FLASHORDER_TEST_DB_PASSWORD", "flashorder"));
-            return;
-        }
-
-        MySQLContainer mysql = LocalMysql.INSTANCE;
-        registry.add("spring.datasource.url", mysql::getJdbcUrl);
-        registry.add("spring.datasource.username", mysql::getUsername);
-        registry.add("spring.datasource.password", mysql::getPassword);
+        MySqlTestDatabase.configure(registry);
     }
 
     @Test
@@ -528,20 +514,6 @@ class SynchronousPurchaseIntegrationTest {
             }
             JsonNode value = JSON.readTree(body).get(name);
             return value == null || value.isNull() ? null : value.asString();
-        }
-    }
-
-    private static final class LocalMysql {
-        private static final MySQLContainer INSTANCE = startMysql();
-
-        private static MySQLContainer startMysql() {
-            var mysql = new MySQLContainer("mysql:8.4")
-                    .withDatabaseName("flashorder_test")
-                    .withUsername("flashorder")
-                    .withPassword("flashorder")
-                    .withCommand("--transaction-isolation=READ-COMMITTED", "--default-time-zone=+00:00");
-            mysql.start();
-            return mysql;
         }
     }
 
