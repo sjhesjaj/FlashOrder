@@ -58,7 +58,8 @@ $flywayLocal = @(
   '-Dflyway.user=flashorder'
   '-Dflyway.password=flashorder'
 )
-.\mvnw.cmd org.flywaydb:flyway-maven-plugin:validate @flywayLocal
+# 预检允许尚未应用的版本迁移，应用启动时会正常执行它们。
+.\mvnw.cmd org.flywaydb:flyway-maven-plugin:validate @flywayLocal '-Dflyway.ignoreMigrationPatterns=*:future,versioned:pending'
 # 只有当唯一的校验错误是找不到 dev seed 时，才运行下一条。
 .\mvnw.cmd org.flywaydb:flyway-maven-plugin:repair @flywayLocal
 ```
