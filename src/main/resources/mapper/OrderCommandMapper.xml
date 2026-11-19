@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.flashorder.request.OrderCommandMapper">
+    <resultMap id="lockedRequest" type="com.flashorder.request.OrderCommandMapper$LockedRequest">
+        <constructor>
+            <arg column="id" javaType="_long"/>
+            <arg column="request_uid" javaType="string"/>
+            <arg column="campaign_id" javaType="_long"/>
+            <arg column="user_id" javaType="_long"/>
+            <arg column="status" javaType="string"/>
+        </constructor>
+    </resultMap>
+
+    <select id="lockRequest" resultMap="lockedRequest">
+        SELECT id, request_uid, campaign_id, user_id, status
+        FROM purchase_request
+        WHERE id = #{requestId}
+        FOR UPDATE
+    </select>
+
+    <update id="markSystemFailed">
+        UPDATE purchase_request
+        SET status = 'SYSTEM_FAILED', reject_reason = 'REQUEST_FAILED', finished_at = NOW(6)
+        WHERE id = #{requestId} AND status = 'ACCEPTED'
+    </update>
+
+    <insert id="insertDeadLetter">
+        INSERT INTO outbox_message (event_id, topic, msg_key, event_type, payload, created_at)
+        VALUES (#{eventId}, 'flashorder.order-commands.DLT', #{messageKey}, 'ORDER_COMMAND_FAILED',
+                JSON_OBJECT('eventId', #{eventId}, 'eventType', 'ORDER_COMMAND_FAILED',
+                            'requestId', #{requestId,jdbcType=BIGINT}, 'requestUid', #{requestUid,jdbcType=VARCHAR},
+                            'campaignId', #{campaignId,jdbcType=BIGINT}, 'sourceTopic', #{sourceTopic},
+                            'sourcePartition', #{sourcePartition}, 'sourceOffset', #{sourceOffset},
+                            'errorType', #{errorType}, 'originalPayload', #{originalPayload,jdbcType=VARCHAR},
+                            'payloadTruncated', #{payloadTruncated}),
+                NOW(6))
+        ON DUPLICATE KEY UPDATE event_id = outbox_message.event_id
+    </insert>
+</mapper>
