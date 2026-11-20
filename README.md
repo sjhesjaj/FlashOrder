@@ -104,7 +104,7 @@ $flywayLocal = @(
 .\mvnw.cmd test
 ```
 
-测试默认通过 Testcontainers 启动独立的 MySQL 8.4 和 Kafka 4.2.2。覆盖抢购、支付与取消竞争、受理回包丢失、Kafka ACK 后 Relay 中断、提交订单后 offset 前失败和死信恢复。同步与订单闭环测试可用 `FLASHORDER_TEST_JDBC_URL`、`FLASHORDER_TEST_DB_USER` 和 `FLASHORDER_TEST_DB_PASSWORD` 指向空的专用测试库，异步测试单独启动一套隔离环境。
+测试默认通过 Testcontainers 启动独立的 MySQL 8.4、Kafka 4.2.2 和 Redis 7.4.12。覆盖抢购、支付与取消竞争、受理回包丢失、Kafka ACK 后 Relay 中断、提交订单后 offset 前失败、死信恢复和入口保护。同步与订单闭环测试可用 `FLASHORDER_TEST_JDBC_URL`、`FLASHORDER_TEST_DB_USER` 和 `FLASHORDER_TEST_DB_PASSWORD` 指向空的专用测试库，异步与入口保护测试各自使用隔离环境。
 
 ## 设计
 

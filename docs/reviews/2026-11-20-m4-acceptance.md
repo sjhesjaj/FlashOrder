@@ -144,4 +144,7 @@
 
 - **N11** 已说明 1 秒应用冷却和 Lettuce 默认重连退避各自影响的时段。重连行为沿用本次验收的配置。 [限流降级设计](../design-v1.md#12-入口检查顺序)
 - **N12** 重新核算 HTTP 响应速率、数据库写入速率、连接池耗时和异步分段速率。同步目标 200/s 的结果引用上面的独立复测。四轮正式实验的证据包已附在报告内。 [修订后的实验报告](../experiments/m4-comparison.md)
+- **N13** 新增 4 项自动化集成测试。真实 Redis、MySQL 和 HTTP 覆盖 Lua 桶、`429` / `409` / `503` 与 `Retry-After`、原键重放及 Redis 停机后本地配额分摊，并核对拒绝时请求表和 Outbox 的记录数。测试通过单独运行异步 API 保留积压，Kafka 停机和重启的端到端结果见上面的故障演练。 [保护链路集成测试](../../src/test/java/com/flashorder/PurchaseProtectionIntegrationTest.java)
 - **N2** 继续保留。支付成功后查询同时读取数据库在更新时写入的 `paid_at` 和事件所需的 `request_uid`。把 `request_uid` 移到加锁读，仍需要读取更新后的 `paid_at`。
+
+收尾复跑使用 JDK 21 执行 `.\mvnw.cmd clean verify`，59 项全部通过，其中包含 4 项新增的入口保护集成测试。
