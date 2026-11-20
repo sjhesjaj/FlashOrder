@@ -2,6 +2,7 @@ package com.flashorder.request;
 
 import io.micrometer.core.instrument.MeterRegistry;
 import java.net.URI;
+import java.util.Optional;
 import org.springframework.context.annotation.Profile;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
@@ -20,10 +21,13 @@ public class PurchaseRequestController {
     private static final String RETRY_AFTER_SECONDS = "1";
     private final PurchaseRequestService requests;
     private final MeterRegistry meters;
+    private final Optional<PurchaseProtection> protection;
 
-    public PurchaseRequestController(PurchaseRequestService requests, MeterRegistry meters) {
+    public PurchaseRequestController(PurchaseRequestService requests, MeterRegistry meters,
+                                     Optional<PurchaseProtection> protection) {
         this.requests = requests;
         this.meters = meters;
+        this.protection = protection;
     }
 
     @PostMapping("/campaigns/{campaignId}/purchase-requests")
@@ -41,7 +45,9 @@ public class PurchaseRequestController {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Invalid idempotency key");
         }
 
-        Submission submission = requests.submit(campaignId, userId, idempotencyKey);
+        Submission submission = protection
+                .map(guard -> guard.submit(campaignId, userId, idempotencyKey))
+                .orElseGet(() -> requests.submit(campaignId, userId, idempotencyKey));
         PurchaseResult result = submission.result();
         meters.counter("flashorder.purchase.submissions",
                 "status", result.status(),
@@ -54,8 +60,7 @@ public class PurchaseRequestController {
                     .header(HttpHeaders.RETRY_AFTER, RETRY_AFTER_SECONDS);
             case "ORDER_CREATED" -> ResponseEntity.created(URI.create("/orders/" + result.orderUid()));
             case "REJECTED", "SYSTEM_FAILED" -> ResponseEntity.status(HttpStatus.CONFLICT);
-            case "NOT_ACCEPTED" -> ResponseEntity.status("CAMPAIGN_NOT_FOUND".equals(result.reason())
-                    ? HttpStatus.NOT_FOUND : HttpStatus.CONFLICT);
+            case "NOT_ACCEPTED" -> notAccepted(result.reason());
             default -> throw new IllegalStateException("Unexpected purchase result: " + result.status());
         };
         if (submission.replayed()) {
@@ -81,5 +86,18 @@ public class PurchaseRequestController {
         if (userId <= 0) {
             throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "Invalid user ID");
         }
+    }
+
+    private static ResponseEntity.BodyBuilder notAccepted(String reason) {
+        return switch (reason) {
+            case "CAMPAIGN_NOT_FOUND" -> ResponseEntity.status(HttpStatus.NOT_FOUND);
+            case "USER_RATE_LIMITED", "CAMPAIGN_RATE_LIMITED" -> ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
+                    .header(HttpHeaders.RETRY_AFTER, RETRY_AFTER_SECONDS);
+            case "IN_FLIGHT_FULL" -> ResponseEntity.status(HttpStatus.SERVICE_UNAVAILABLE)
+                    .header(HttpHeaders.RETRY_AFTER, RETRY_AFTER_SECONDS);
+            case "SOLD_OUT" -> ResponseEntity.status(HttpStatus.CONFLICT)
+                    .header(HttpHeaders.RETRY_AFTER, RETRY_AFTER_SECONDS);
+            default -> ResponseEntity.status(HttpStatus.CONFLICT);
+        };
     }
 }

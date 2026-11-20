@@ -32,14 +32,18 @@ public class PurchaseRequestService {
         if (existing != null) {
             return replay(campaignId, existing);
         }
+        return submitAfterReplayCheck(campaignId, userId, idempotencyKey);
+    }
 
+    @Transactional
+    public Submission submitAfterReplayCheck(long campaignId, long userId, String idempotencyKey) {
         String requestUid = UuidV7.next();
         GeneratedKey requestKey = new GeneratedKey();
         int inserted;
         try {
             inserted = requests.insertIfCampaignOpen(campaignId, userId, idempotencyKey, requestUid, requestKey);
         } catch (DuplicateKeyException exception) {
-            existing = requests.findByKey(userId, idempotencyKey);
+            StoredPurchaseRequest existing = requests.findByKey(userId, idempotencyKey);
             if (existing != null) {
                 return replay(campaignId, existing);
             }
@@ -49,7 +53,7 @@ public class PurchaseRequestService {
         if (inserted == 0) {
             boolean campaignExists = requests.campaignExists(campaignId);
             // A concurrent submission may have committed while the campaign was closing.
-            existing = requests.findByKey(userId, idempotencyKey);
+            StoredPurchaseRequest existing = requests.findByKey(userId, idempotencyKey);
             if (existing != null) {
                 return replay(campaignId, existing);
             }
@@ -67,6 +71,15 @@ public class PurchaseRequestService {
         return new Submission(orders.attemptOrder(requestId, requestUid, campaignId, userId), false);
     }
 
+    Optional<Submission> findReplay(long campaignId, long userId, String idempotencyKey) {
+        return Optional.ofNullable(requests.findByKey(userId, idempotencyKey))
+                .map(existing -> replay(campaignId, existing));
+    }
+
+    boolean usesAsyncIntake() {
+        return asyncIntake;
+    }
+
     public Optional<PurchaseResult> find(long userId, String requestUid) {
         return Optional.ofNullable(requests.findOwned(userId, requestUid))
                 .map(StoredPurchaseRequest::result);
@@ -79,7 +92,7 @@ public class PurchaseRequestService {
         return new Submission(existing.result(), true);
     }
 
-    private static Submission rejectUnaccepted(String reason) {
+    static Submission rejectUnaccepted(String reason) {
         return new Submission(new PurchaseResult(null, "NOT_ACCEPTED", reason, null), false);
     }
 }
