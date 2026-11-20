@@ -228,9 +228,13 @@ class AsyncPurchaseIntegrationTest {
         assertThat(newLease.messages()).anyMatch(message -> message.id() == messageId);
 
         assertThat(relayStore.markPublished(oldLease.leaseToken(), List.of(messageId))).isZero();
+        assertThat(relayStore.retrySoon(oldLease.leaseToken(), List.of(messageId), 1)).isZero();
         assertThat(count("SELECT COUNT(*) FROM outbox_message WHERE id = ? AND published_at IS NULL"
-                + " AND lease_token = ?", messageId, newLease.leaseToken())).isEqualTo(1);
-        jdbc.update("UPDATE outbox_message SET lease_until = NOW(6) - INTERVAL 1 SECOND WHERE id = ?", messageId);
+                + " AND lease_token = ? AND lease_until > NOW(6) + INTERVAL 10 SECOND",
+                messageId, newLease.leaseToken())).isEqualTo(1);
+        assertThat(relayStore.retrySoon(newLease.leaseToken(), List.of(messageId), 1)).isEqualTo(1);
+        await(() -> count("SELECT COUNT(*) FROM outbox_message WHERE id = ? AND lease_until <= NOW(6)",
+                messageId) == 1);
         relay.publishBatch();
         await(() -> status(uid).equals("ORDER_CREATED"));
         assertOrderOnce(uid, campaign);

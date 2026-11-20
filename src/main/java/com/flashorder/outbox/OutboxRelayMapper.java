@@ -15,6 +15,9 @@ public interface OutboxRelayMapper {
 
     int markPublished(@Param("leaseToken") String leaseToken, @Param("messageIds") List<Long> messageIds);
 
+    int retrySoon(@Param("leaseToken") String leaseToken, @Param("messageIds") List<Long> messageIds,
+                  @Param("retryDelayMs") int retryDelayMs);
+
     int deletePublishedBatch(@Param("retentionDays") int retentionDays, @Param("batchSize") int batchSize);
 
     record OutboxMessage(long id, String topic, String key, String payload) {

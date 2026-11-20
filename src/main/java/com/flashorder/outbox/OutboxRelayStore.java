@@ -42,6 +42,11 @@ public class OutboxRelayStore {
         return mapper.markPublished(leaseToken, messageIds);
     }
 
+    @Transactional
+    public int retrySoon(String leaseToken, List<Long> messageIds, int retryDelayMs) {
+        return mapper.retrySoon(leaseToken, messageIds, retryDelayMs);
+    }
+
     @Transactional(propagation = Propagation.REQUIRES_NEW)
     public int deletePublishedBatch(int batchSize) {
         return mapper.deletePublishedBatch(retentionDays, batchSize);

@@ -38,6 +38,15 @@
         </foreach>
     </update>
 
+    <update id="retrySoon">
+        UPDATE outbox_message FORCE INDEX (PRIMARY)
+        SET lease_until = LEAST(lease_until, TIMESTAMPADD(MICROSECOND, #{retryDelayMs} * 1000, NOW(6)))
+        WHERE published_at IS NULL AND lease_token = #{leaseToken} AND id IN
+        <foreach collection="messageIds" item="id" open="(" separator="," close=")">
+            #{id}
+        </foreach>
+    </update>
+
     <delete id="deletePublishedBatch">
         DELETE /*+ INDEX(outbox_message idx_outbox_message_published_id) */ FROM outbox_message
         WHERE published_at &lt; TIMESTAMPADD(DAY, -#{retentionDays}, UTC_TIMESTAMP(6))

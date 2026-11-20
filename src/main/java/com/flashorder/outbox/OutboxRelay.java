@@ -3,12 +3,12 @@ package com.flashorder.outbox;
 import com.flashorder.outbox.OutboxRelayMapper.OutboxMessage;
 import com.flashorder.outbox.OutboxRelayStore.ClaimedBatch;
 
-import java.util.LinkedHashMap;
+import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
-import java.util.concurrent.Future.State;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 
@@ -18,6 +18,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Profile;
+import org.springframework.core.NestedExceptionUtils;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.kafka.support.SendResult;
 import org.springframework.stereotype.Service;
@@ -36,11 +37,13 @@ public class OutboxRelay {
     private final OutboxRelayStore store;
     private final int batchSize;
     private final int leaseMs;
+    private final int retryDelayMs;
     private final long sendBudgetNanos;
 
     public OutboxRelay(KafkaTemplate<String, String> kafka, OutboxRelayStore store,
                        @Value(BATCH_SIZE_PROPERTY) int batchSize,
-                       @Value("${flashorder.outbox-relay.lease-ms:30000}") int leaseMs) {
+                       @Value("${flashorder.outbox-relay.lease-ms:30000}") int leaseMs,
+                       @Value("${flashorder.outbox-relay.retry-delay-ms:1000}") int retryDelayMs) {
         Map<String, Object> producer = kafka.getProducerFactory().getConfigurationProperties();
         Map<String, Object> defaults = ProducerConfig.configDef().defaultValues();
         long maxBlockMs = producerMillis(producer, defaults, ProducerConfig.MAX_BLOCK_MS_CONFIG);
@@ -49,10 +52,14 @@ public class OutboxRelay {
             throw new IllegalArgumentException("Outbox relay needs a positive batch size and a lease longer than "
                     + "Kafka max.block.ms plus delivery.timeout.ms and the 1000 ms database update reserve");
         }
+        if (retryDelayMs < 1) {
+            throw new IllegalArgumentException("flashorder.outbox-relay.retry-delay-ms must be positive");
+        }
         this.kafka = kafka;
         this.store = store;
         this.batchSize = batchSize;
         this.leaseMs = leaseMs;
+        this.retryDelayMs = retryDelayMs;
         this.sendBudgetNanos = TimeUnit.MILLISECONDS.toNanos(maxBlockMs + deliveryMs);
     }
 
@@ -65,30 +72,57 @@ public class OutboxRelay {
             return new BatchResult(0, 0);
         }
 
-        Map<Long, CompletableFuture<SendResult<String, String>>> sends = new LinkedHashMap<>();
+        Map<Long, CompletableFuture<SendResult<String, String>>> sends = new HashMap<>();
         for (OutboxMessage message : batch.messages()) {
-            if (ackDeadline - System.nanoTime() <= sendBudgetNanos) {
+            if (Thread.currentThread().isInterrupted() || ackDeadline - System.nanoTime() <= sendBudgetNanos) {
                 break;
             }
             try {
                 sends.put(message.id(), kafka.send(message.topic(), message.key(), message.payload()));
             } catch (RuntimeException failure) {
                 LOG.debug("Could not enqueue outbox message {} for {}", message.id(), message.topic(), failure);
+                if (NestedExceptionUtils.getMostSpecificCause(failure)
+                        instanceof org.apache.kafka.common.errors.TimeoutException) {
+                    break;
+                }
             }
         }
 
-        List<Long> acknowledgedIds = awaitAcknowledgements(sends, ackDeadline);
-        if (acknowledgedIds.size() < batch.messages().size()) {
-            LOG.warn("{} of {} leased outbox messages have no confirmed Kafka delivery and can retry after lease expiry",
-                    batch.messages().size() - acknowledgedIds.size(), batch.messages().size());
+        awaitAcknowledgements(sends, ackDeadline);
+        if (Thread.currentThread().isInterrupted()) {
+            return new BatchResult(batch.messages().size(), 0);
         }
+
+        List<Long> acknowledgedIds = new ArrayList<>();
+        List<Long> retryIds = new ArrayList<>();
+        for (OutboxMessage message : batch.messages()) {
+            var send = sends.get(message.id());
+            if (send == null) {
+                retryIds.add(message.id());
+                continue;
+            }
+            switch (send.state()) {
+                case SUCCESS -> acknowledgedIds.add(message.id());
+                case FAILED -> retryIds.add(message.id());
+                case RUNNING, CANCELLED -> {
+                    // A broker acknowledgement may still arrive, so leave the lease in place.
+                }
+            }
+        }
+
         // The compare-and-set protects any rows that another relay reclaimed while this worker was delayed.
         int published = acknowledgedIds.isEmpty() ? 0 : store.markPublished(batch.leaseToken(), acknowledgedIds);
+        int retrying = retryIds.isEmpty() ? 0 : store.retrySoon(batch.leaseToken(), retryIds, retryDelayMs);
+        int unresolved = batch.messages().size() - acknowledgedIds.size() - retryIds.size();
+        if (retrying > 0 || unresolved > 0) {
+            LOG.warn("Shortened the lease for {} outbox messages. {} sends remain unresolved",
+                    retrying, unresolved);
+        }
         return new BatchResult(batch.messages().size(), published);
     }
 
-    private static List<Long> awaitAcknowledgements(Map<Long, CompletableFuture<SendResult<String, String>>> sends,
-                                                     long deadline) {
+    private static void awaitAcknowledgements(Map<Long, CompletableFuture<SendResult<String, String>>> sends,
+                                              long deadline) {
         CompletableFuture<?>[] futures = sends.values().toArray(CompletableFuture<?>[]::new);
         try {
             CompletableFuture.allOf(futures).get(Math.max(0, deadline - System.nanoTime()), TimeUnit.NANOSECONDS);
@@ -96,12 +130,7 @@ public class OutboxRelay {
             LOG.debug("Outbox batch had an unsuccessful Kafka delivery", failure);
         } catch (InterruptedException interrupted) {
             Thread.currentThread().interrupt();
-            return List.of();
         }
-        return sends.entrySet().stream()
-                .filter(send -> send.getValue().state() == State.SUCCESS)
-                .map(Map.Entry::getKey)
-                .toList();
     }
 
     private static long producerMillis(Map<String, Object> producer, Map<String, Object> defaults, String name) {
