@@ -76,7 +76,7 @@ py -3 .\scripts\benchmark.py --campaign 1 --requests 600 --rate 100 --out .\targ
 
 省略 `--rate` 会立即提交一批请求。脚本保存每次请求的 HTTP 结果，并默认每 10 笔抽一笔查询终态。正式对比为两种受理模式分别准备活动和库存，记录相同的提供负载、抽样频率与运行环境。
 
-[M4 对比实验与验收记录](docs/experiments/m4-comparison.md)
+[M4 对比实验和原始数据](docs/experiments/m4-comparison.md) · [M4 独立验收](docs/reviews/2026-11-20-m4-acceptance.md)
 
 ## 升级用过旧种子迁移的 M1 数据库
 
