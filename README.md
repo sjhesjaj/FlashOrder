@@ -52,6 +52,32 @@ Relay 默认每批领取 100 条。满批全部确认后立即处理下一批，
 
 每个消费者进程默认启动 1 个监听线程。需要同时处理多个活动时，可以设 `FLASHORDER_CONSUMER_CONCURRENCY=2` 或调整 `spring.kafka.listener.concurrency`。消费组最多同时使用 6 个命令分区，同一活动的命令仍进同一个分区。
 
+## M4 入口保护和监控
+
+```powershell
+docker compose --profile async --profile protection --profile monitoring up -d --wait
+$env:FLASHORDER_INTAKE_MODE = 'async'
+$env:FLASHORDER_PROTECTION_ENABLED = 'true'
+.\mvnw.cmd spring-boot:run '-Dspring-boot.run.profiles=dev'
+```
+
+保护启用后按顺序检查用户配额、原幂等请求、活动窗口与售罄快照、活动配额和异步在途门槛。`429` 和在途门槛的 `503 IN_FLIGHT_FULL` 都带 `Retry-After`。售罄快速拒绝返回 `409 NOT_ACCEPTED`，已持久化的业务拒绝仍可重放。
+
+- Redis 默认使用 `127.0.0.1:16379`。用 `flashorder.protection.rate-limit.*` 设置用户和活动的 `*-rate-per-second`、`*-burst`。Redis 降级时会按 `flashorder.protection.rate-limit.instances` 分摊本地配额。
+- `flashorder.protection.backlog-limit` 默认 500，异步 API 每 1 秒采样各活动的 `ACCEPTED` 数。售罄快照每 200 ms 刷新，超过 600 ms 走数据库校验。
+- Prometheus 在 `http://127.0.0.1:19090`，可查询 `mysql_global_status_innodb_row_lock_waits` 和 `mysql_global_status_innodb_row_lock_time`。Hikari 上限默认 10，可通过 `FLASHORDER_DB_POOL_SIZE` 调整。
+- 分三进程抓取时分别启用 `api`、`scheduler,ops` 和 `consumer,ops`。后两者只有管理端口，默认分别为 18081 和 18082。用 `FLASHORDER_MANAGEMENT_PORT` 和对应的 `FLASHORDER_*_SCRAPE_PORT` 配置自定义端口。
+
+压测器只需 Python 3.10 或更新版本。按固定速率提交示例。
+
+```powershell
+py -3 .\scripts\benchmark.py --campaign 1 --requests 600 --rate 100 --out .\target\benchmark-example
+```
+
+省略 `--rate` 会立即提交一批请求。脚本保存每次请求的 HTTP 结果，并默认每 10 笔抽一笔查询终态。正式对比为两种受理模式分别准备活动和库存，记录相同的提供负载、抽样频率与运行环境。
+
+[M4 对比实验与验收记录](docs/experiments/m4-comparison.md)
+
 ## 升级用过旧种子迁移的 M1 数据库
 
 从旧版本更新代码后，首次启动前先执行 `.\mvnw.cmd clean`，清理旧构建产物里的迁移脚本。

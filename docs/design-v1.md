@@ -1,6 +1,6 @@
 # FlashOrder V1 设计
 
-> 状态：2026-11-19 定稿，A–F 决策和 G1–G7 修订已合入。G8 对应 M4。理由见 [decisions.md](decisions.md)。原稿存档在 [archive/design-v1-draft.md](archive/design-v1-draft.md)。
+> 状态：A–F 决策和 G1–G8 修订已合入设计。理由见 [decisions.md](decisions.md)。原稿存档在 [archive/design-v1-draft.md](archive/design-v1-draft.md)。
 
 **第一版做一条完整的限量抢购链路：提交请求 → 异步建单并预留库存 → 模拟支付或超时释放 → 查到最终结果。**
 
@@ -69,7 +69,9 @@ sequenceDiagram
     U->>A: 提交抢购请求 + 幂等键
     A->>C: 用户级限流
     A->>D: 按幂等键查已有请求
-    A->>A: 活动窗口、售罄缓存、全局限流、在途上限
+    A->>A: 活动窗口和售罄缓存
+    A->>C: 活动级限流
+    A->>A: 检查在途门槛
     A->>D: 同事务写入请求记录与建单命令
     D-->>A: 事务提交
     A-->>U: 202 + requestUid + Location + Retry-After
@@ -97,22 +99,22 @@ sequenceDiagram
 
 按顺序执行，便宜的检查放在前面：
 
-M3 执行身份检查、幂等回查和数据库受理事务。Redis 限流、活动窗口预检、售罄缓存和在途上限随 M4 接入。
+M4 通过 `FLASHORDER_PROTECTION_ENABLED=true` 开启保护链路。同步与异步使用相同的限流和活动快照，异步额外检查在途门槛。关闭保护可复跑 M1–M3 基线。
 
 1. 从请求头 `X-User-Id` 取当前用户（第一版模拟登录，真实认证留到后续）。
-2. **用户级限流**，在 Redis 里做令牌桶，超限返回 `429`。
+2. **用户级限流**，在 Redis 里做令牌桶，超限返回 `429 USER_RATE_LIMITED`。
 3. **按 `(user_id, idempotency_key)` 查已有请求。** 找到时：活动相同，就按第三节的响应规则返回这个请求的当前状态，并带上 `Idempotent-Replayed: true` 头；活动不同，返回 `409 IDEMPOTENCY_CONFLICT`。这一步必须放在各种快速拒绝之前。否则用户回包丢失后重试，可能收到"售罄"，实际上原请求已经建单了。
 4. **活动窗口预检**：拿本地缓存的活动起止时间做一次预检，不在窗口内返回 `409 CAMPAIGN_CLOSED`。最终以第 8 步受理事务里的数据库时间为准。
 5. **售罄缓存**：缓存显示可用库存为 0 时，返回 `409 SOLD_OUT` + `Retry-After`，不写记录。
-6. **活动级全局限流**，在 Redis 里做令牌桶，阈值按受理事务的容量定，超限返回 `429` + `Retry-After`。
-7. **在途上限**：这个活动处于 `ACCEPTED` 状态的请求超过阈值时，返回 `503` + `Retry-After`。
-8. **受理事务**：插入请求记录（`ACCEPTED`，`accepted_at = NOW(6)`）和 outbox 建单命令。插入时用 `INSERT ... SELECT ... FROM campaign WHERE id = ? AND NOW(6) >= starts_at AND NOW(6) < ends_at` 带上窗口条件，影响 0 行就返回 `409 CAMPAIGN_CLOSED`。这样窗口判断和 `accepted_at` 用的是同一个时钟。如果并发的同键插入撞了唯一键，回到第 3 步读已有请求。
+6. **活动级全局限流**，在 Redis 里做令牌桶，超限返回 `429 CAMPAIGN_RATE_LIMITED` + `Retry-After`。
+7. **在途门槛**。异步请求的活动已有至少阈值数量的 `ACCEPTED`，则返回 `503 IN_FLIGHT_FULL` 和 `Retry-After`。
+8. **受理事务**。异步模式插入请求记录（`ACCEPTED`，`accepted_at = NOW(6)`）和 Outbox 建单命令。用 `INSERT ... SELECT ... FROM campaign WHERE id = ? AND NOW(6) >= starts_at AND NOW(6) < ends_at` 带上窗口条件，影响零行时区分 `CAMPAIGN_CLOSED` 和 `CAMPAIGN_NOT_FOUND`。并发同键撞唯一键时读取原请求。
 
-**售罄缓存**由每个 API 实例每 200 ms 读一次活跃活动的 `available`。这是非加锁读，不和热点行争锁。超时归还库存后，缓存在一个刷新周期内自动恢复，不需要额外清除。缓存最多滞后 200 ms，后果只有两种：少量请求被受理后再被消费者拒绝，或者库存刚归还时少量用户被告知售罄。两种都可以接受。
+**售罄缓存**由每个 API 实例每 200 ms 从 MySQL 读取，使用非加锁读。刷新成功时，超时归还库存会在下一次刷新后反映到缓存。缓存年龄超过 600 ms 时跳过快速拒绝。窗口附近由受理事务按数据库时间裁决。
 
-**限流降级**：Redis 不可用时不能直接放行，改用进程内令牌桶，每个实例的配额是全局配额除以实例数。
+**限流降级**。正常时单键 Lua 使用 Redis 时间原子更新令牌桶。Redis 不可用时使用有界的进程内令牌桶，速率和容量都除以配置的 API 实例数。进程每隔约 1 秒派一个请求探测恢复。Redis 和各进程分别记账，切换期间可能使用本地桶剩余的突发配额。
 
-**在途上限**统计的是 `ACCEPTED` 请求数，Relay 停摆和消费者停摆都会让它上涨。每个实例缓存这个数，每秒刷新一次。
+**在途门槛**统计的是 `ACCEPTED` 数，Relay 和消费者停摆都能反映出来。每个实例默认每秒刷新一次，失败或过期时回到活动级索引查询。这是软门槛。Redis 正常时，一轮成功采样间隔内的新增量受活动桶的突发容量加补充速率乘实际间隔约束。采样延迟与 Redis 降级另行记录。
 
 ### 1.3 Kafka 与 Relay
 
@@ -262,7 +264,7 @@ SELECT i.total, i.available,
 
 | 接口 | 成功 | 其他结果 |
 |---|---|---|
-| `POST /campaigns/{campaignId}/purchase-requests`（头：`X-User-Id`、`Idempotency-Key`） | 按请求当前状态返回（见下表），首次提交和重放用同一套规则 | 入口拒绝，不写记录：`404 CAMPAIGN_NOT_FOUND`；`409` `IDEMPOTENCY_CONFLICT` / `CAMPAIGN_CLOSED` / `SOLD_OUT`；`429` 限流；`503` 数据库暂不可用或在途已满 |
+| `POST /campaigns/{campaignId}/purchase-requests`（头 `X-User-Id`、`Idempotency-Key`） | 按请求当前状态返回（见下表），首次提交和重放用同一套规则 | 入口拒绝不写记录。`404 CAMPAIGN_NOT_FOUND`。`409` `IDEMPOTENCY_CONFLICT` / `CAMPAIGN_CLOSED` / `SOLD_OUT`。`429` 用户或活动限流。`503` 数据库暂不可用或 `IN_FLIGHT_FULL` |
 | `GET /purchase-requests/{requestUid}` | `200` + 状态、原因、`orderUid`；处理中时带 `Retry-After` | 不属于当前用户时返回 `404` |
 | `GET /orders/{orderUid}` | `200` + 订单状态、UTC 时间 `expireAt` | `404` |
 | `POST /orders/{orderUid}/payments`（头 `X-User-Id`、`Idempotency-Key`） | `200`，包含 `orderUid`、`status: PAID`、UTC `paidAt` | `409`，包含 `orderUid`、`status: REJECTED`、`reason: ORDER_EXPIRED` / `ORDER_CANCELLED`。订单不存在或属于他人时返回 `404` |
@@ -284,8 +286,8 @@ SELECT i.total, i.available,
 从 M1 开始接入，压测报告直接用这些数据：
 
 - 受理延迟（HTTP 入口到 `202`），用直方图。
-- 受理到终态延迟（消费者写终态时记 `NOW - accepted_at`），用直方图。
-- 在途请求数、未发布的 outbox 行数。
+- 受理到终态延迟。消费者用锁定读返回的 MySQL 受理时长，加上单调时钟测得的执行和提交时间，在事务提交后记录直方图 `flashorder.requests.terminal.latency`。
+- 在途请求数显示最近一次成功采样。未发布的 Outbox 行数显示最新采样，失败时输出 NaN。
 - Kafka consumer lag。
 - Hikari 连接池等待。
 - InnoDB 行锁等待（`Innodb_row_lock_waits`、`Innodb_row_lock_time`，由 mysqld-exporter 采集）。
