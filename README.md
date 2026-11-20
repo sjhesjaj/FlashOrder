@@ -48,6 +48,10 @@ Kafka 默认绑定 `127.0.0.1:19092`。下单接口受理成功返回 `202`，�
 
 Relay 默认每批领取 100 条。满批全部确认后立即处理下一批，直到取到短批、批次未全部确认，或本轮累计达到 1 秒。已领取的批次按 30 秒租约处理，轮次结束后等待 250 ms 再检查。分别用 `flashorder.outbox-relay.batch-size`、`flashorder.outbox-relay.max-round-ms`、`flashorder.outbox-relay.lease-ms` 和 `flashorder.outbox-relay.fixed-delay-ms` 调整。
 
+对生产者已报告失败的消息及本批未尝试发送的消息，Relay 会将租约缩短至约 1 秒后可重领。通过 `flashorder.outbox-relay.retry-delay-ms` 调整这个间隔。等待时尚无发送结果或进程中断的消息按原租约恢复。
+
+每个消费者进程默认启动 1 个监听线程。需要同时处理多个活动时，可以设 `FLASHORDER_CONSUMER_CONCURRENCY=2` 或调整 `spring.kafka.listener.concurrency`。消费组最多同时使用 6 个命令分区，同一活动的命令仍进同一个分区。
+
 ## 升级用过旧种子迁移的 M1 数据库
 
 从旧版本更新代码后，首次启动前先执行 `.\mvnw.cmd clean`，清理旧构建产物里的迁移脚本。

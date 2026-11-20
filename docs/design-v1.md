@@ -118,10 +118,11 @@ M3 执行身份检查、幂等回查和数据库受理事务。Redis 限流、�
 
 - Topic `flashorder.order-commands`，**key 为 `campaign_id`**。同一活动的命令进同一个分区，由一个消费者线程依次处理，消费者之间不会在库存行上排队。代价是单个活动的吞吐受单线程限制。分区数不少于同时进行的活动数，本地默认 6 个。
 - 生产者使用 `acks=all` 和幂等发送。默认 `max.block.ms=1000`、`delivery.timeout.ms=5000`。
-- Relay 在短事务内用 `FOR UPDATE SKIP LOCKED` 领取未发布且租约为空或已过期的消息，写入 `lease_token`、`lease_until` 后提交。事务外发送。收到 Kafka ACK 后，按消息 ID 和租约令牌回写 `published_at`。发送失败或 ACK 后中断时，租约到期后允许重新领取。默认每批 100 条，租约 30 秒。
+- Relay 在短事务内用 `FOR UPDATE SKIP LOCKED` 领取未发布且租约为空或已过期的消息，写入 `lease_token`、`lease_until` 后提交。事务外发送。收到 Kafka ACK 后，按消息 ID 和租约令牌回写 `published_at`。默认每批 100 条，租约 30 秒。
+- 生产者同步发送超时后停止向本批追加发送。生产者已报告失败或尚未尝试发送的记录按消息 ID 和租约令牌缩短到约 1 秒后可重领。发送结果未返回、发送 Future 被取消或进程中断时按原租约恢复。生产者报告失败时，消息也可能已经写入 broker，重投沿用原事件 ID，由消费者去重。
 - 单轮中，满批全部标记发布后立即领取下一批。取到短批、有消息未能标记发布、或单轮已用时 1 秒时结束本轮。已领取的批次按租约处理结束，下一轮默认在本轮结束 250 ms 后启动。
-- 消费者关闭自动提交，按条提交 offset（`AckMode.RECORD`）。先锁请求并核对命令里的请求和活动身份，数据库事务提交后再提交 offset。
-- 顺序：同一活动的命令在分区内有序，但多个 Relay 实例并发领取时，批与批之间可能交错。**第一版只保证近似的先到先得。**
+- 消费者关闭自动提交，按条提交 offset（`AckMode.RECORD`）。先锁请求并核对命令里的请求和活动身份，数据库事务提交后再提交 offset。`spring.kafka.listener.concurrency` 默认 1，可用 `FLASHORDER_CONSUMER_CONCURRENCY` 调整。同一消费组内，每个分区仍交给一个监听线程。
+- 消费者按分区内已发布命令的顺序处理。多个 Relay 并发领取或有消息重试时，后受理的命令可能先发布，订单事件也可能交错。**第一版只保证近似的先到先得。**
 - 订单事件发到 `flashorder.order-events`，key 为订单号，事件带稳定的 `event_id`。第一版没有下游消费者。
 - Relay 每天按批清理超过 7 天的已发布 Outbox 行。清理保留所有待发布行。
 
