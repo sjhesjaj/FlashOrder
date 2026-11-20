@@ -11,6 +11,10 @@
         </constructor>
     </resultMap>
 
+    <select id="countUnpublished" resultType="_long">
+        SELECT COUNT(*) FROM outbox_message WHERE published_at IS NULL
+    </select>
+
     <select id="lockDueMessages" resultMap="outboxMessage">
         SELECT id, topic, msg_key, payload
         FROM outbox_message FORCE INDEX (idx_outbox_message_published_id)

@@ -2,8 +2,13 @@ package com.flashorder.request;
 
 import com.flashorder.request.OrderCommandMapper.DeadLetter;
 import com.flashorder.request.OrderCommandMapper.LockedRequest;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Timer;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
+import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.TimeUnit;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.context.annotation.Profile;
@@ -11,6 +16,8 @@ import org.springframework.core.NestedExceptionUtils;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 import tools.jackson.databind.json.JsonMapper;
 
 @Service
@@ -23,27 +30,38 @@ public class OrderCommandProcessingService {
     private final OrderCommandMapper commands;
     private final PurchaseOrderProcessor orders;
     private final JsonMapper json;
+    private final Map<String, Timer> terminalLatency;
 
-    public OrderCommandProcessingService(OrderCommandMapper commands, PurchaseOrderProcessor orders, JsonMapper json) {
+    public OrderCommandProcessingService(OrderCommandMapper commands, PurchaseOrderProcessor orders, JsonMapper json,
+                                         MeterRegistry meters) {
         this.commands = commands;
         this.orders = orders;
         this.json = json;
+        this.terminalLatency = Map.of(
+                "ORDER_CREATED", terminalTimer(meters, "ORDER_CREATED"),
+                "REJECTED", terminalTimer(meters, "REJECTED"),
+                "SYSTEM_FAILED", terminalTimer(meters, "SYSTEM_FAILED"));
     }
 
     @Transactional
     public void process(OrderCommand command) {
+        long beforeLockQuery = System.nanoTime();
         LockedRequest request = lockMatchingRequest(command);
         if (request == null) {
             throw new OrderCommand.Invalid("Order command does not match a stored purchase request");
         }
         if ("ACCEPTED".equals(request.status())) {
-            orders.attemptOrder(request.id(), request.requestUid(), request.campaignId(), request.userId());
+            PurchaseResult result = orders.attemptOrder(
+                    request.id(), request.requestUid(), request.campaignId(), request.userId());
+            recordTerminalAfterCommit(request.acceptedAgeMicros(), beforeLockQuery, result.status());
         }
     }
 
     @Transactional(propagation = Propagation.REQUIRES_NEW)
     public void recover(ConsumerRecord<?, ?> record, Exception failure) {
-        LockedRequest request = lockRequestForRecovery(record);
+        OrderCommand command = readRecoverableCommand(record);
+        long beforeLockQuery = System.nanoTime();
+        LockedRequest request = command == null ? null : lockMatchingRequest(command);
         if (request != null) {
             if (!"ACCEPTED".equals(request.status())) {
                 return;
@@ -53,11 +71,14 @@ public class OrderCommandProcessingService {
             }
         }
         commands.insertDeadLetter(deadLetter(record, failure, request));
+        if (request != null) {
+            recordTerminalAfterCommit(request.acceptedAgeMicros(), beforeLockQuery, "SYSTEM_FAILED");
+        }
     }
 
-    private LockedRequest lockRequestForRecovery(ConsumerRecord<?, ?> record) {
+    private OrderCommand readRecoverableCommand(ConsumerRecord<?, ?> record) {
         try {
-            return lockMatchingRequest(OrderCommand.read(json, record));
+            return OrderCommand.read(json, record);
         } catch (OrderCommand.Invalid ignored) {
             return null;
         }
@@ -70,6 +91,31 @@ public class OrderCommandProcessingService {
             return null;
         }
         return request;
+    }
+
+    private void recordTerminalAfterCommit(long acceptedAgeMicros, long beforeLockQuery, String status) {
+        Timer timer = terminalLatency.get(status);
+        if (timer == null) {
+            return;
+        }
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCommit() {
+                // MySQL evaluates NOW at statement start. Approximate through the app-observed commit
+                // with monotonic elapsed time from just before that statement, including its outbound trip.
+                long elapsedMicros = TimeUnit.NANOSECONDS.toMicros(System.nanoTime() - beforeLockQuery);
+                timer.record(Math.max(0, acceptedAgeMicros + elapsedMicros), TimeUnit.MICROSECONDS);
+            }
+        });
+    }
+
+    private static Timer terminalTimer(MeterRegistry meters, String status) {
+        return Timer.builder("flashorder.requests.terminal.latency")
+                .description("Estimated time from durable request acceptance through the terminal commit")
+                .tag("status", status)
+                .publishPercentileHistogram()
+                .maximumExpectedValue(Duration.ofHours(1))
+                .register(meters);
     }
 
     private static DeadLetter deadLetter(ConsumerRecord<?, ?> record, Exception failure, LockedRequest request) {

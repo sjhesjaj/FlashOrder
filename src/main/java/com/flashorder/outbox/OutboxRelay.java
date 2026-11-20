@@ -11,7 +11,10 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
 
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
 import org.apache.kafka.clients.producer.ProducerConfig;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -39,8 +42,13 @@ public class OutboxRelay {
     private final int leaseMs;
     private final int retryDelayMs;
     private final long sendBudgetNanos;
+    private final Counter claimedMessages;
+    private final Counter publishedMessages;
+    private final Counter retriedMessages;
+    private final Counter unresolvedMessages;
+    private final AtomicBoolean deliveryDegraded = new AtomicBoolean();
 
-    public OutboxRelay(KafkaTemplate<String, String> kafka, OutboxRelayStore store,
+    public OutboxRelay(KafkaTemplate<String, String> kafka, OutboxRelayStore store, MeterRegistry registry,
                        @Value(BATCH_SIZE_PROPERTY) int batchSize,
                        @Value("${flashorder.outbox-relay.lease-ms:30000}") int leaseMs,
                        @Value("${flashorder.outbox-relay.retry-delay-ms:1000}") int retryDelayMs) {
@@ -61,6 +69,10 @@ public class OutboxRelay {
         this.leaseMs = leaseMs;
         this.retryDelayMs = retryDelayMs;
         this.sendBudgetNanos = TimeUnit.MILLISECONDS.toNanos(maxBlockMs + deliveryMs);
+        this.claimedMessages = registry.counter("flashorder.outbox.relay.claimed");
+        this.publishedMessages = registry.counter("flashorder.outbox.relay.published");
+        this.retriedMessages = registry.counter("flashorder.outbox.relay.retry.scheduled");
+        this.unresolvedMessages = registry.counter("flashorder.outbox.relay.unresolved");
     }
 
     @Transactional(propagation = Propagation.NEVER)
@@ -71,6 +83,7 @@ public class OutboxRelay {
         if (batch.messages().isEmpty()) {
             return new BatchResult(0, 0);
         }
+        claimedMessages.increment(batch.messages().size());
 
         Map<Long, CompletableFuture<SendResult<String, String>>> sends = new HashMap<>();
         for (OutboxMessage message : batch.messages()) {
@@ -90,6 +103,7 @@ public class OutboxRelay {
 
         awaitAcknowledgements(sends, ackDeadline);
         if (Thread.currentThread().isInterrupted()) {
+            unresolvedMessages.increment(batch.messages().size());
             return new BatchResult(batch.messages().size(), 0);
         }
 
@@ -112,11 +126,21 @@ public class OutboxRelay {
 
         // The compare-and-set protects any rows that another relay reclaimed while this worker was delayed.
         int published = acknowledgedIds.isEmpty() ? 0 : store.markPublished(batch.leaseToken(), acknowledgedIds);
+        publishedMessages.increment(published);
         int retrying = retryIds.isEmpty() ? 0 : store.retrySoon(batch.leaseToken(), retryIds, retryDelayMs);
+        retriedMessages.increment(retrying);
         int unresolved = batch.messages().size() - acknowledgedIds.size() - retryIds.size();
-        if (retrying > 0 || unresolved > 0) {
-            LOG.warn("Shortened the lease for {} outbox messages. {} sends remain unresolved",
-                    retrying, unresolved);
+        unresolvedMessages.increment(unresolved);
+        if (!retryIds.isEmpty() || unresolved > 0) {
+            if (deliveryDegraded.compareAndSet(false, true)) {
+                LOG.warn("Outbox delivery degraded. Shortened {} leases. {} sends remain unresolved",
+                        retrying, unresolved);
+            } else {
+                LOG.debug("Outbox delivery still degraded. Shortened {} leases. {} sends remain unresolved",
+                        retrying, unresolved);
+            }
+        } else if (deliveryDegraded.compareAndSet(true, false)) {
+            LOG.info("Outbox delivery recovered");
         }
         return new BatchResult(batch.messages().size(), published);
     }

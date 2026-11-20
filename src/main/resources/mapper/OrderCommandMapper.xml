@@ -9,11 +9,13 @@
             <arg column="campaign_id" javaType="_long"/>
             <arg column="user_id" javaType="_long"/>
             <arg column="status" javaType="string"/>
+            <arg column="accepted_age_micros" javaType="_long"/>
         </constructor>
     </resultMap>
 
     <select id="lockRequest" resultMap="lockedRequest">
-        SELECT id, request_uid, campaign_id, user_id, status
+        SELECT id, request_uid, campaign_id, user_id, status,
+               TIMESTAMPDIFF(MICROSECOND, accepted_at, NOW(6)) AS accepted_age_micros
         FROM purchase_request
         WHERE id = #{requestId}
         FOR UPDATE

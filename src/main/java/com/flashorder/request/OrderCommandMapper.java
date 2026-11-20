@@ -11,7 +11,8 @@ public interface OrderCommandMapper {
 
     int insertDeadLetter(DeadLetter deadLetter);
 
-    record LockedRequest(long id, String requestUid, long campaignId, long userId, String status) {
+    record LockedRequest(long id, String requestUid, long campaignId, long userId, String status,
+                         long acceptedAgeMicros) {
     }
 
     record DeadLetter(String eventId, String messageKey, Long requestId, String requestUid, Long campaignId,

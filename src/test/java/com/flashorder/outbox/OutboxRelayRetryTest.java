@@ -3,6 +3,7 @@ package com.flashorder.outbox;
 import com.flashorder.outbox.OutboxRelay.BatchResult;
 import com.flashorder.outbox.OutboxRelayMapper.OutboxMessage;
 import com.flashorder.outbox.OutboxRelayStore.ClaimedBatch;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
@@ -39,6 +40,7 @@ class OutboxRelayRetryTest {
     private ProducerFactory<String, String> producerFactory;
     @Mock
     private OutboxRelayStore store;
+    private final SimpleMeterRegistry meters = new SimpleMeterRegistry();
     private OutboxRelay relay;
 
     @BeforeEach
@@ -46,7 +48,7 @@ class OutboxRelayRetryTest {
         when(kafka.getProducerFactory()).thenReturn(producerFactory);
         when(producerFactory.getConfigurationProperties()).thenReturn(Map.of(
                 ProducerConfig.MAX_BLOCK_MS_CONFIG, 10, ProducerConfig.DELIVERY_TIMEOUT_MS_CONFIG, 10));
-        relay = new OutboxRelay(kafka, store, BATCH_SIZE, LEASE_MS, RETRY_DELAY_MS);
+        relay = new OutboxRelay(kafka, store, meters, BATCH_SIZE, LEASE_MS, RETRY_DELAY_MS);
     }
 
     @Test
@@ -68,6 +70,10 @@ class OutboxRelayRetryTest {
         verify(store).markPublished(LEASE, List.of(1L));
         verify(store).retrySoon(LEASE, List.of(2L, 4L, 5L), RETRY_DELAY_MS);
         verify(kafka, never()).send(TOPIC, "5", "{}");
+        assertThat(meters.get("flashorder.outbox.relay.claimed").counter().count()).isEqualTo(5);
+        assertThat(meters.get("flashorder.outbox.relay.published").counter().count()).isEqualTo(1);
+        assertThat(meters.get("flashorder.outbox.relay.retry.scheduled").counter().count()).isEqualTo(3);
+        assertThat(meters.get("flashorder.outbox.relay.unresolved").counter().count()).isEqualTo(1);
     }
 
     @Test

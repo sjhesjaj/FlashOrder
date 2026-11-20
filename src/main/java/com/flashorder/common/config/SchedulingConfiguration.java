@@ -6,6 +6,6 @@ import org.springframework.scheduling.annotation.EnableScheduling;
 
 @Configuration(proxyBeanMethods = false)
 @EnableScheduling
-@Profile("scheduler")
+@Profile("scheduler | api")
 public class SchedulingConfiguration {
 }

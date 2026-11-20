@@ -58,6 +58,84 @@ services:
       start_period: 15s
       retries: 20
 
+  redis:
+    image: redis:7.4.12-alpine
+    profiles: [protection]
+    ports:
+      - "127.0.0.1:${FLASHORDER_REDIS_PORT:-16379}:6379"
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+
+  mysqld-exporter:
+    image: prom/mysqld-exporter:v0.21.0
+    profiles: [monitoring]
+    depends_on:
+      mysql:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${FLASHORDER_MYSQL_EXPORTER_PORT:-19104}:9104"
+    environment:
+      MYSQLD_EXPORTER_PASSWORD: ${FLASHORDER_MYSQL_PASSWORD:-flashorder}
+    command:
+      - --mysqld.address=mysql:3306
+      - --mysqld.username=flashorder
+      - --config.my-cnf=/dev/null
+      - --no-collect.global_variables
+      - --no-collect.slave_status
+      - --no-collect.info_schema.innodb_cmp
+      - --no-collect.info_schema.innodb_cmpmem
+      - --no-collect.info_schema.query_response_time
+
+  prometheus:
+    image: prom/prometheus:v3.13.5
+    profiles: [monitoring]
+    depends_on:
+      - mysqld-exporter
+    ports:
+      - "127.0.0.1:${FLASHORDER_PROMETHEUS_PORT:-19090}:9090"
+    labels:
+      # Compose uses the service configuration to decide whether to recreate the container.
+      flashorder.scrape-targets: >-
+        ${FLASHORDER_SCRAPE_HOST:-host.docker.internal}:
+        ${FLASHORDER_API_SCRAPE_PORT:-8080},${FLASHORDER_SCHEDULER_SCRAPE_PORT:-18081},${FLASHORDER_CONSUMER_SCRAPE_PORT:-18082}
+    configs:
+      - source: prometheus-config
+        target: /etc/prometheus/prometheus.yml
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=7d
+    volumes:
+      - prometheus-data:/prometheus
+
+configs:
+  prometheus-config:
+    content: |
+      global:
+        scrape_interval: 2s
+        scrape_timeout: 1s
+      scrape_configs:
+        - job_name: mysql
+          static_configs:
+            - targets: ["mysqld-exporter:9104"]
+        - job_name: flashorder-api
+          metrics_path: /actuator/prometheus
+          static_configs:
+            - targets: ["${FLASHORDER_SCRAPE_HOST:-host.docker.internal}:${FLASHORDER_API_SCRAPE_PORT:-8080}"]
+        - job_name: flashorder-scheduler
+          metrics_path: /actuator/prometheus
+          static_configs:
+            - targets: ["${FLASHORDER_SCRAPE_HOST:-host.docker.internal}:${FLASHORDER_SCHEDULER_SCRAPE_PORT:-18081}"]
+        - job_name: flashorder-consumer
+          metrics_path: /actuator/prometheus
+          static_configs:
+            - targets: ["${FLASHORDER_SCRAPE_HOST:-host.docker.internal}:${FLASHORDER_CONSUMER_SCRAPE_PORT:-18082}"]
+
 volumes:
   mysql-data:
   kafka-data:
+  prometheus-data:

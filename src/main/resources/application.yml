@@ -8,11 +8,18 @@ spring:
         - api
         - scheduler
         - consumer
+  data:
+    redis:
+      host: "${FLASHORDER_REDIS_HOST:127.0.0.1}"
+      port: ${FLASHORDER_REDIS_PORT:16379}
+      connect-timeout: 100ms
+      timeout: 100ms
   datasource:
     url: "${FLASHORDER_DB_URL:jdbc:mysql://127.0.0.1:13306/flashorder}"
     username: ${FLASHORDER_DB_USER:flashorder}
     password: ${FLASHORDER_DB_PASSWORD:flashorder}
     hikari:
+      maximum-pool-size: ${FLASHORDER_DB_POOL_SIZE:10}
       transaction-isolation: TRANSACTION_READ_COMMITTED
       data-source-properties:
         connectionTimeZone: UTC
@@ -56,8 +63,13 @@ server:
 
 flashorder:
   intake-mode: "${FLASHORDER_INTAKE_MODE:sync}"
+  protection:
+    enabled: ${FLASHORDER_PROTECTION_ENABLED:false}
 
 management:
+  health:
+    redis:
+      enabled: false
   endpoints:
     web:
       exposure:
@@ -71,6 +83,35 @@ management:
 spring:
   config:
     activate:
-      on-profile: "(scheduler | consumer) & !api"
+      on-profile: "(scheduler | consumer) & !api & !ops"
   main:
     web-application-type: none
+
+---
+spring:
+  config:
+    activate:
+      on-profile: "ops & !api & !scheduler & !consumer"
+  main:
+    web-application-type: none
+
+---
+spring:
+  config:
+    activate:
+      on-profile: "(scheduler | consumer) & !api & ops"
+server:
+  port: -1
+management:
+  server:
+    address: 127.0.0.1
+    port: ${FLASHORDER_MANAGEMENT_PORT:18081}
+
+---
+spring:
+  config:
+    activate:
+      on-profile: "consumer & !scheduler & !api & ops"
+management:
+  server:
+    port: ${FLASHORDER_MANAGEMENT_PORT:18082}

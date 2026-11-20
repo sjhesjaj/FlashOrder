@@ -7,6 +7,8 @@ import org.apache.ibatis.annotations.Param;
 
 @Mapper
 public interface OutboxRelayMapper {
+    long countUnpublished();
+
     List<OutboxMessage> lockDueMessages(@Param("batchSize") int batchSize);
 
     int leaseMessages(@Param("leaseToken") String leaseToken,
