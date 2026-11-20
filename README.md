@@ -108,6 +108,8 @@ $flywayLocal = @(
 
 ## 设计
 
-[现行设计](docs/design-v1.md) · [决策记录](docs/decisions.md)
+[产品需求（PRD）](docs/prd.md) · [技术文档](docs/technical-overview.md) · [现行设计](docs/design-v1.md) · [决策记录](docs/decisions.md)
+
+![FlashOrder 架构与请求链路](docs/images/flashorder-architecture.svg)
 
 并发测试写法参考 [burst-safe-inventory](https://github.com/AkshajM16/burst-safe-inventory/tree/801b6953e4cb8bc822bfec77cf0d7c7ff782f804)（MIT）。
