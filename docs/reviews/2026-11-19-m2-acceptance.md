@@ -62,7 +62,7 @@
 
 | # | 观察 | 建议时间 |
 |---|---|---|
-| N1 | `restoreStock` 的"不超过总量"条件一旦失败，整批回滚，下一轮还会领到同一批订单，后面所有到期订单都会被卡住。正常情况下不会触发，但一旦库存数据出错，取消任务会整体停摆，只能从日志里发现。建议加一个失败计数指标，或者把出问题的活动单独隔离出来。 | M4 前 |
+| N1 | `restoreStock` 的"不超过总量"条件一旦失败，整批回滚，下一轮还会领到同一批订单，后面所有到期订单都会被卡住。正常情况下不会触发，但一旦库存数据出错，取消任务会整体停摆，只能从日志里发现。建议加一个失败计数指标，或者把出问题的活动单独隔离出来。 | **已关闭**（`f5b1ea8`，失败计数），见 [M4 验收记录](2026-11-20-m4-acceptance.md) |
 | N2 | 每次支付成功都要多查一次 `findPaidOrderDetails`（JOIN 请求表），只为了给事件取 `request_uid`。可以像取消任务那样，在锁定订单的那条查询里用子查询一并取出。 | M4 压测前 |
-| N3 | 单独运行 `scheduler` 时不开 Web 服务，`/actuator/health` 和 `/actuator/prometheus` 都访问不到，`flashorder_orders_cancelled_total` 也采集不到。这一条和 F7 的监控栈一起处理，比如给它单独开一个 management 端口。 | M4，并入 F7 |
+| N3 | 单独运行 `scheduler` 时不开 Web 服务，`/actuator/health` 和 `/actuator/prometheus` 都访问不到，`flashorder_orders_cancelled_total` 也采集不到。这一条和 F7 的监控栈一起处理，比如给它单独开一个 management 端口。 | **已关闭**（`f5b1ea8`，管理端口），见 [M4 验收记录](2026-11-20-m4-acceptance.md) |
 | N4 | 对账的 gauge 每个活动一条序列，从不删除。第一版的活动数量少，可以接受。 | 不处理 |
