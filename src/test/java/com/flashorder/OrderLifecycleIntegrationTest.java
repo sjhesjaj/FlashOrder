@@ -407,12 +407,12 @@ class OrderLifecycleIntegrationTest {
     }
 
     private List<String> orders(long campaign, int count) throws Exception {
-        try (var executor = Executors.newVirtualThreadPerTaskExecutor()) {
-            var start = new CountDownLatch(1);
-            var purchases = race(executor, start, count, i -> purchase(campaign, 1000 + i, "buy-" + campaign));
-            start.countDown();
-            return collect(purchases).stream().map(OrderLifecycleIntegrationTest::createdOrder).toList();
+        var prepared = new ArrayList<String>(count);
+        // Prepare the fixture without competing for the same inventory row before the race under test.
+        for (int index = 0; index < count; index++) {
+            prepared.add(order(campaign, 1000 + index));
         }
+        return prepared;
     }
 
     private static String createdOrder(Reply reply) {
