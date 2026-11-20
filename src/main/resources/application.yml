@@ -40,6 +40,7 @@ spring:
         allow.auto.create.topics: false
     listener:
       ack-mode: record
+      concurrency: ${FLASHORDER_CONSUMER_CONCURRENCY:1}
   task:
     scheduling:
       pool:
